@@ -27,15 +27,16 @@ bool OrderBook<LP>::cancel_order(uint64_t order_id) {
         return false;
 
     Order* order_ptr = it->second;
+    uint64_t price = order_ptr->price;
     auto& levels = (order_ptr->side == Side::BUY) ? bids_ : asks_;
-    auto& level_orders = levels[order_ptr->price];
+    auto& level_orders = levels[price];
 
     level_orders.remove_if([order_id](const Order& o) {
         return o.id == order_id;
     });
 
     if (level_orders.empty())
-        levels.erase(order_ptr->price);
+        levels.erase(price);
 
     orders_.erase(it);
     return true;

@@ -16,7 +16,7 @@ add_library(orderbook
 add_executable(test_correctness
     tests/test_correctness.cpp
 )
-target_link_libraries(test_correctness orderbook)
+target_link_libraries(test_correctness orderbook pthread)
 
 # Benchmark executable
 add_executable(bench_comparison

@@ -86,10 +86,16 @@ python3 scripts/plot_results.py   # generate graphs from CSV
 
 | Test | What it verifies |
 |------|-----------------|
-| Add limit order | Best bid/ask update correctly |
+| Add limit order | Best bid/ask update; duplicate ID rejected |
 | Price-time priority | FIFO within same price level |
-| Cancel order | Order removed, book state consistent |
+| Cancel order | Order removed; double-cancel returns false |
 | Market order matching | Crosses price levels, partial fills |
+| Partial fill | Resting order stays on book until fully consumed |
+| Multi-level cross | Market order sweeps multiple price levels in order |
+| Cancel nonexistent | Returns false, no crash |
+| Empty book queries | best_bid/ask return nullopt; total_orders returns 0 |
+| Cancel updates best price | Cancelling best-price order exposes next level |
+| Concurrent add + cancel | 4 threads, 40k ops — no crash, no deadlock |
 
 Both `OrderBook<MutexPolicy>` and `OrderBook<SharedMutexPolicy>` pass the same test suite.
 
