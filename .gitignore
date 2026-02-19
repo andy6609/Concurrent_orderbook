@@ -41,3 +41,7 @@ vgcore.*
 # PDF files (if too large)
 *.pdf
 
+# bkit plugin files (system/tracking)
+.bkit-*.json
+.pdca-*.json
+
