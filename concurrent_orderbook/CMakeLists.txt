@@ -19,10 +19,10 @@ add_executable(test_correctness
 target_link_libraries(test_correctness orderbook)
 
 # Benchmark executable
-add_executable(bench_performance
-    benchmarks/bench_performance.cpp
+add_executable(bench_comparison
+    benchmarks/bench_comparison.cpp
 )
-target_link_libraries(bench_performance orderbook pthread)
+target_link_libraries(bench_comparison orderbook pthread)
 
 # Enable warnings
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
