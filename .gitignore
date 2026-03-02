@@ -45,3 +45,6 @@ vgcore.*
 .bkit-*.json
 .pdca-*.json
 
+# Private docs
+docs/portfolio_analysis.md
+docs/portfolio_analysis.md
