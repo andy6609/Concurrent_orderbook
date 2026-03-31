@@ -204,6 +204,98 @@ void test_concurrent_add_cancel() {
 }
 
 // ============================================================
+// Limit-limit crossing tests
+// ============================================================
+
+template <typename LP>
+void test_limit_limit_crossing_full() {
+    std::cout << "[TEST] Limit-Limit Crossing (full fill)\n";
+    OrderBook<LP> book;
+
+    // Resting sell at 100
+    book.add_order(Order::Limit(1, 1, Side::SELL, 100, 10));
+
+    // Aggressive buy at 110 — should immediately cross at resting price (100)
+    auto result = book.add_order(Order::Limit(2, 1, Side::BUY, 110, 10));
+
+    assert(result.accepted);
+    assert(result.trades.size() == 1);
+    assert(result.trades[0].price    == 100);  // resting price used
+    assert(result.trades[0].quantity == 10);
+    assert(result.trades[0].buy_order_id  == 2);
+    assert(result.trades[0].sell_order_id == 1);
+
+    // Both orders fully filled — book empty
+    assert(book.total_orders() == 0);
+
+    std::cout << "  PASSED\n";
+}
+
+template <typename LP>
+void test_limit_limit_crossing_partial() {
+    std::cout << "[TEST] Limit-Limit Crossing (partial — remainder rests)\n";
+    OrderBook<LP> book;
+
+    // Only 3 available at 100
+    book.add_order(Order::Limit(1, 1, Side::SELL, 100, 3));
+
+    // Aggressive buy 10 at 110 — fills 3, rests 7 at 110
+    auto result = book.add_order(Order::Limit(2, 1, Side::BUY, 110, 10));
+
+    assert(result.accepted);
+    assert(result.trades.size() == 1);
+    assert(result.trades[0].quantity == 3);
+
+    // 7 remaining should rest as BUY at 110
+    assert(book.total_orders() == 1);
+    assert(book.best_bid_price() == 110);
+
+    std::cout << "  PASSED\n";
+}
+
+template <typename LP>
+void test_limit_limit_crossing_multi_level() {
+    std::cout << "[TEST] Limit-Limit Crossing (multi-level)\n";
+    OrderBook<LP> book;
+
+    book.add_order(Order::Limit(1, 1, Side::SELL, 100, 5));
+    book.add_order(Order::Limit(2, 1, Side::SELL, 105, 5));
+
+    // Aggressive buy at 110 — should sweep both levels
+    auto result = book.add_order(Order::Limit(3, 1, Side::BUY, 110, 10));
+
+    assert(result.accepted);
+    assert(result.trades.size() == 2);
+    assert(result.trades[0].price == 100);
+    assert(result.trades[1].price == 105);
+
+    assert(book.total_orders() == 0);
+    assert(book.best_ask_price() == std::nullopt);
+
+    std::cout << "  PASSED\n";
+}
+
+template <typename LP>
+void test_limit_limit_no_crossing() {
+    std::cout << "[TEST] Limit-Limit No Crossing (prices don't overlap)\n";
+    OrderBook<LP> book;
+
+    book.add_order(Order::Limit(1, 1, Side::SELL, 100, 10));
+
+    // Buy at 90 — below ask, should just rest
+    auto result = book.add_order(Order::Limit(2, 1, Side::BUY, 90, 10));
+
+    assert(result.accepted);
+    assert(result.trades.empty());
+
+    assert(book.total_orders() == 2);
+    assert(book.best_bid_price() == 90);
+    assert(book.best_ask_price() == 100);
+
+    std::cout << "  PASSED\n";
+}
+
+// ============================================================
 // Run all tests for a given policy
 // ============================================================
 
@@ -223,6 +315,10 @@ void run_all_tests(const std::string& label) {
     test_empty_book_queries<LP>();
     test_cancel_updates_best_price<LP>();
     test_concurrent_add_cancel<LP>();
+    test_limit_limit_crossing_full<LP>();
+    test_limit_limit_crossing_partial<LP>();
+    test_limit_limit_crossing_multi_level<LP>();
+    test_limit_limit_no_crossing<LP>();
 
     std::cout << "\nAll " << label << " tests PASSED.\n\n";
 }
