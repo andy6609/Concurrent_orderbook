@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <iostream>
+#include <vector>
 
 enum class Side {
     BUY,
@@ -42,6 +43,11 @@ struct Trade {
     uint32_t symbol_id;
     uint64_t price;
     uint64_t quantity;
+};
+
+struct AddResult {
+    bool accepted;
+    std::vector<Trade> trades;
 };
 
 inline std::ostream& operator<<(std::ostream& os, const Order& o) {
