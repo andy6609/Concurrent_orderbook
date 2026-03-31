@@ -5,13 +5,14 @@
 #include <unordered_map>
 #include <optional>
 #include <list>
+#include <atomic>
 
 template <typename LockPolicy = SharedMutexPolicy>
 class OrderBook {
 public:
     OrderBook() = default;
 
-    bool add_order(const Order& order);
+    AddResult add_order(const Order& order);
     bool cancel_order(uint64_t order_id);
 
     std::optional<uint64_t> best_bid_price() const;
@@ -28,9 +29,11 @@ private:
     std::map<uint64_t, std::list<Order>> asks_;
     std::unordered_map<uint64_t, Order*> orders_;
 
-    void add_limit_order(const Order& order);
-    void match_market_order(Order order);
-    void execute_trade(Order& incoming, Order& resting, uint64_t exec_qty);
+    static std::atomic<uint64_t> next_trade_id_;
+
+    void add_limit_order(const Order& order, std::vector<Trade>& trades);
+    void match_market_order(Order order, std::vector<Trade>& trades);
+    void execute_trade(Order& incoming, Order& resting, uint64_t exec_qty, std::vector<Trade>& trades);
 };
 
 using ExclusiveOrderBook = OrderBook<MutexPolicy>;

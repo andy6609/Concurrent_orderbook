@@ -4,18 +4,23 @@
 // === Write operations ===
 
 template <typename LP>
-bool OrderBook<LP>::add_order(const Order& order) {
+std::atomic<uint64_t> OrderBook<LP>::next_trade_id_{1};
+
+template <typename LP>
+AddResult OrderBook<LP>::add_order(const Order& order) {
     typename LP::write_lock lk(mtx_);
 
     if (orders_.find(order.id) != orders_.end())
-        return false;
+        return {false, {}};
+
+    std::vector<Trade> trades;
 
     if (order.type == OrderType::LIMIT)
-        add_limit_order(order);
+        add_limit_order(order, trades);
     else
-        match_market_order(order);
+        match_market_order(order, trades);
 
-    return true;
+    return {true, std::move(trades)};
 }
 
 template <typename LP>
@@ -79,7 +84,7 @@ size_t OrderBook<LP>::total_ask_levels() const {
 // === Internal (lock already held) ===
 
 template <typename LP>
-void OrderBook<LP>::add_limit_order(const Order& order) {
+void OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trades) {
     auto& levels = (order.side == Side::BUY) ? bids_ : asks_;
     auto& level_orders = levels[order.price];
     level_orders.push_back(order);
@@ -87,7 +92,7 @@ void OrderBook<LP>::add_limit_order(const Order& order) {
 }
 
 template <typename LP>
-void OrderBook<LP>::match_market_order(Order order) {
+void OrderBook<LP>::match_market_order(Order order, std::vector<Trade>& trades) {
     auto& levels = (order.side == Side::BUY) ? asks_ : bids_;
 
     while (order.remaining > 0 && !levels.empty()) {
@@ -99,7 +104,7 @@ void OrderBook<LP>::match_market_order(Order order) {
             if (resting.remaining == 0) continue;
 
             uint64_t exec_qty = std::min(order.remaining, resting.remaining);
-            execute_trade(order, resting, exec_qty);
+            execute_trade(order, resting, exec_qty, trades);
         }
 
         level_orders.remove_if([](const Order& o) { return o.is_filled(); });
@@ -110,9 +115,20 @@ void OrderBook<LP>::match_market_order(Order order) {
 }
 
 template <typename LP>
-void OrderBook<LP>::execute_trade(Order& incoming, Order& resting, uint64_t qty) {
+void OrderBook<LP>::execute_trade(Order& incoming, Order& resting, uint64_t qty,
+                                   std::vector<Trade>& trades) {
     incoming.remaining -= qty;
     resting.remaining -= qty;
+
+    uint64_t tid = next_trade_id_.fetch_add(1, std::memory_order_relaxed);
+    Trade t;
+    t.trade_id     = tid;
+    t.symbol_id    = resting.symbol_id;
+    t.price        = resting.price;
+    t.quantity     = qty;
+    t.buy_order_id  = (incoming.side == Side::BUY) ? incoming.id : resting.id;
+    t.sell_order_id = (incoming.side == Side::SELL) ? incoming.id : resting.id;
+    trades.push_back(t);
 
     if (resting.is_filled())
         orders_.erase(resting.id);

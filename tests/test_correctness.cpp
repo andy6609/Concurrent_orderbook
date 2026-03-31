@@ -14,14 +14,14 @@ void test_add_limit_order() {
     std::cout << "[TEST] Add Limit Order\n";
     OrderBook<LP> book;
 
-    assert(book.add_order(Order::Limit(1, 1, Side::BUY, 100, 10)));
+    assert(book.add_order(Order::Limit(1, 1, Side::BUY, 100, 10)).accepted);
     assert(book.best_bid_price() == 100);
 
-    assert(book.add_order(Order::Limit(2, 1, Side::SELL, 110, 5)));
+    assert(book.add_order(Order::Limit(2, 1, Side::SELL, 110, 5)).accepted);
     assert(book.best_ask_price() == 110);
 
     // Duplicate ID rejected
-    assert(book.add_order(Order::Limit(1, 1, Side::BUY, 105, 10)) == false);
+    assert(!book.add_order(Order::Limit(1, 1, Side::BUY, 105, 10)).accepted);
 
     std::cout << "  PASSED\n";
 }
