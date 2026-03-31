@@ -85,10 +85,32 @@ size_t OrderBook<LP>::total_ask_levels() const {
 
 template <typename LP>
 void OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trades) {
-    auto& levels = (order.side == Side::BUY) ? bids_ : asks_;
-    auto& level_orders = levels[order.price];
-    level_orders.push_back(order);
-    orders_[order.id] = &level_orders.back();
+    // Check if this order crosses the book (aggressive limit order)
+    bool crosses = false;
+    if (order.side == Side::BUY && !asks_.empty())
+        crosses = (order.price >= asks_.begin()->first);
+    else if (order.side == Side::SELL && !bids_.empty())
+        crosses = (order.price <= bids_.rbegin()->first);
+
+    if (!crosses) {
+        // No crossing — just rest in the book
+        auto& levels = (order.side == Side::BUY) ? bids_ : asks_;
+        auto& level_orders = levels[order.price];
+        level_orders.push_back(order);
+        orders_[order.id] = &level_orders.back();
+        return;
+    }
+
+    // Aggressive — match first, then rest any remaining quantity
+    Order working = order;
+    match_market_order(working, trades);
+
+    if (working.remaining > 0) {
+        auto& levels = (order.side == Side::BUY) ? bids_ : asks_;
+        auto& level_orders = levels[order.price];
+        level_orders.push_back(working);
+        orders_[order.id] = &level_orders.back();
+    }
 }
 
 template <typename LP>
