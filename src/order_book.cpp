@@ -115,10 +115,13 @@ void OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trad
 
 template <typename LP>
 void OrderBook<LP>::match_market_order(Order order, std::vector<Trade>& trades) {
-    auto& levels = (order.side == Side::BUY) ? asks_ : bids_;
+    // BUY matches against asks (cheapest first = begin)
+    // SELL matches against bids (most expensive first = rbegin)
+    bool is_buy = (order.side == Side::BUY);
+    auto& levels = is_buy ? asks_ : bids_;
 
     while (order.remaining > 0 && !levels.empty()) {
-        auto it = levels.begin();
+        auto it = is_buy ? levels.begin() : std::prev(levels.end());
         auto& level_orders = it->second;
 
         for (auto& resting : level_orders) {
