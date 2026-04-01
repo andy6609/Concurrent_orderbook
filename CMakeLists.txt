@@ -10,6 +10,7 @@ include_directories(include)
 # OrderBook library
 add_library(orderbook
     src/order_book.cpp
+    src/order_pool.cpp
 )
 
 # Test executable
