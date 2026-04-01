@@ -101,10 +101,15 @@ void OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trad
         return;
     }
 
-    // Aggressive — match first, then rest any remaining quantity
+    // Aggressive — match first, then handle remainder based on TIF
     Order working = order;
     match_market_order(working, trades);
 
+    // IOC: cancel any unfilled remainder (never rests)
+    if (order.tif == TimeInForce::IOC)
+        return;
+
+    // GTC: rest whatever didn't fill
     if (working.remaining > 0) {
         auto& levels = (order.side == Side::BUY) ? bids_ : asks_;
         auto& level_orders = levels[order.price];
