@@ -93,12 +93,31 @@ void OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trad
         crosses = (order.price <= bids_.rbegin()->first);
 
     if (!crosses) {
+        // FOK with no crossing — immediately reject (can't fill at all)
+        if (order.tif == TimeInForce::FOK)
+            return;
         // No crossing — just rest in the book
         auto& levels = (order.side == Side::BUY) ? bids_ : asks_;
         auto& level_orders = levels[order.price];
         level_orders.push_back(order);
         orders_[order.id] = &level_orders.back();
         return;
+    }
+
+    // FOK: pre-check that enough quantity is available across all price levels
+    if (order.tif == TimeInForce::FOK) {
+        auto& opp_levels = (order.side == Side::BUY) ? asks_ : bids_;
+        uint64_t available = 0;
+        for (auto& [lvl_price, lvl_orders] : opp_levels) {
+            // Only count levels within the limit price
+            if (order.side == Side::BUY  && lvl_price > order.price) break;
+            if (order.side == Side::SELL && lvl_price < order.price) break;
+            for (auto& o : lvl_orders)
+                available += o.remaining;
+            if (available >= order.remaining) break;
+        }
+        if (available < order.remaining)
+            return;  // Kill — not enough to fill entirely
     }
 
     // Aggressive — match first, then handle remainder based on TIF
