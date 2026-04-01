@@ -13,26 +13,34 @@ enum class OrderType {
     MARKET
 };
 
+enum class TimeInForce {
+    GTC,   // Good Till Cancel — rests until matched or cancelled (default)
+    IOC,   // Immediate or Cancel — match what you can, cancel the rest
+    FOK    // Fill or Kill — fill entire quantity now, or cancel entirely
+};
+
 struct Order {
     uint64_t id;
     uint32_t symbol_id;
-    
-    OrderType type;
-    Side side;
-    
+
+    OrderType   type;
+    Side        side;
+    TimeInForce tif;
+
     uint64_t price;
     uint64_t quantity;
     uint64_t remaining;
-    
-    static Order Limit(uint64_t id, uint32_t symbol, Side side, 
-                       uint64_t price, uint64_t qty) {
-        return Order{id, symbol, OrderType::LIMIT, side, price, qty, qty};
+
+    static Order Limit(uint64_t id, uint32_t symbol, Side side,
+                       uint64_t price, uint64_t qty,
+                       TimeInForce tif = TimeInForce::GTC) {
+        return Order{id, symbol, OrderType::LIMIT, side, tif, price, qty, qty};
     }
-    
+
     static Order Market(uint64_t id, uint32_t symbol, Side side, uint64_t qty) {
-        return Order{id, symbol, OrderType::MARKET, side, 0, qty, qty};
+        return Order{id, symbol, OrderType::MARKET, side, TimeInForce::IOC, 0, qty, qty};
     }
-    
+
     bool is_filled() const { return remaining == 0; }
 };
 
