@@ -296,6 +296,89 @@ void test_limit_limit_no_crossing() {
 }
 
 // ============================================================
+// IOC and FOK tests
+// ============================================================
+
+template <typename LP>
+void test_ioc_partial_fill() {
+    std::cout << "[TEST] IOC — partial fill, remainder cancelled\n";
+    OrderBook<LP> book;
+
+    book.add_order(Order::Limit(1, 1, Side::SELL, 100, 5));
+
+    // IOC buy 10 — only 5 available, fills 5, cancels remaining 5
+    auto result = book.add_order(Order::Limit(2, 1, Side::BUY, 100, 10, TimeInForce::IOC));
+
+    assert(result.accepted);
+    assert(result.trades.size() == 1);
+    assert(result.trades[0].quantity == 5);
+
+    // IOC order must NOT rest — book should be empty
+    assert(book.total_orders() == 0);
+    assert(book.best_bid_price() == std::nullopt);
+
+    std::cout << "  PASSED\n";
+}
+
+template <typename LP>
+void test_ioc_no_fill() {
+    std::cout << "[TEST] IOC — no crossing, cancelled immediately\n";
+    OrderBook<LP> book;
+
+    book.add_order(Order::Limit(1, 1, Side::SELL, 110, 10));
+
+    // IOC buy at 100 — no crossing, entire order cancelled
+    auto result = book.add_order(Order::Limit(2, 1, Side::BUY, 100, 10, TimeInForce::IOC));
+
+    assert(result.accepted);
+    assert(result.trades.empty());
+
+    // Only the resting sell remains
+    assert(book.total_orders() == 1);
+    assert(book.best_bid_price() == std::nullopt);
+
+    std::cout << "  PASSED\n";
+}
+
+template <typename LP>
+void test_fok_full_fill() {
+    std::cout << "[TEST] FOK — enough quantity, executes fully\n";
+    OrderBook<LP> book;
+
+    book.add_order(Order::Limit(1, 1, Side::SELL, 100, 10));
+
+    // FOK buy 10 — exactly 10 available, should fill entirely
+    auto result = book.add_order(Order::Limit(2, 1, Side::BUY, 100, 10, TimeInForce::FOK));
+
+    assert(result.accepted);
+    assert(result.trades.size() == 1);
+    assert(result.trades[0].quantity == 10);
+    assert(book.total_orders() == 0);
+
+    std::cout << "  PASSED\n";
+}
+
+template <typename LP>
+void test_fok_kill() {
+    std::cout << "[TEST] FOK — insufficient quantity, entire order killed\n";
+    OrderBook<LP> book;
+
+    book.add_order(Order::Limit(1, 1, Side::SELL, 100, 5));
+
+    // FOK buy 10 — only 5 available, entire order rejected
+    auto result = book.add_order(Order::Limit(2, 1, Side::BUY, 100, 10, TimeInForce::FOK));
+
+    assert(result.accepted);
+    assert(result.trades.empty());
+
+    // Resting sell must be untouched
+    assert(book.total_orders() == 1);
+    assert(book.best_ask_price() == 100);
+
+    std::cout << "  PASSED\n";
+}
+
+// ============================================================
 // Run all tests for a given policy
 // ============================================================
 
@@ -319,6 +402,10 @@ void run_all_tests(const std::string& label) {
     test_limit_limit_crossing_partial<LP>();
     test_limit_limit_crossing_multi_level<LP>();
     test_limit_limit_no_crossing<LP>();
+    test_ioc_partial_fill<LP>();
+    test_ioc_no_fill<LP>();
+    test_fok_full_fill<LP>();
+    test_fok_kill<LP>();
 
     std::cout << "\nAll " << label << " tests PASSED.\n\n";
 }
