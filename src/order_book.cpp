@@ -38,14 +38,13 @@ bool OrderBook<LP>::cancel_order(uint64_t order_id) {
     auto& levels = (order_ptr->side == Side::BUY) ? bids_ : asks_;
     auto& level_orders = levels[price];
 
-    level_orders.remove_if([order_id](const Order& o) {
-        return o.id == order_id;
-    });
+    level_orders.remove_if([order_id](Order* o) { return o->id == order_id; });
 
     if (level_orders.empty())
         levels.erase(price);
 
     orders_.erase(it);
+    pool_.deallocate(order_ptr);
     return true;
 }
 
@@ -98,11 +97,11 @@ void OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trad
         // IOC/FOK with no crossing — immediately cancel (nothing to fill)
         if (order.tif == TimeInForce::IOC || order.tif == TimeInForce::FOK)
             return;
-        // GTC: rest in the book
-        auto& levels = (order.side == Side::BUY) ? bids_ : asks_;
-        auto& level_orders = levels[order.price];
-        level_orders.push_back(order);
-        orders_[order.id] = &level_orders.back();
+        // GTC: allocate from pool and rest in the book
+        Order* slot = pool_.allocate(order);
+        auto& level_orders = (order.side == Side::BUY ? bids_ : asks_)[order.price];
+        level_orders.push_back(slot);
+        orders_[order.id] = slot;
         return;
     }
 
@@ -111,11 +110,10 @@ void OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trad
         auto& opp_levels = (order.side == Side::BUY) ? asks_ : bids_;
         uint64_t available = 0;
         for (auto& [lvl_price, lvl_orders] : opp_levels) {
-            // Only count levels within the limit price
             if (order.side == Side::BUY  && lvl_price > order.price) break;
             if (order.side == Side::SELL && lvl_price < order.price) break;
-            for (auto& o : lvl_orders)
-                available += o.remaining;
+            for (Order* o : lvl_orders)
+                available += o->remaining;
             if (available >= order.remaining) break;
         }
         if (available < order.remaining)
@@ -132,10 +130,10 @@ void OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trad
 
     // GTC: rest whatever didn't fill
     if (working.remaining > 0) {
-        auto& levels = (order.side == Side::BUY) ? bids_ : asks_;
-        auto& level_orders = levels[order.price];
-        level_orders.push_back(working);
-        orders_[order.id] = &level_orders.back();
+        Order* slot = pool_.allocate(working);
+        auto& level_orders = (order.side == Side::BUY ? bids_ : asks_)[order.price];
+        level_orders.push_back(slot);
+        orders_[order.id] = slot;
     }
 }
 
@@ -150,15 +148,21 @@ void OrderBook<LP>::match_market_order(Order& order, std::vector<Trade>& trades)
         auto it = is_buy ? levels.begin() : std::prev(levels.end());
         auto& level_orders = it->second;
 
-        for (auto& resting : level_orders) {
+        for (Order* resting : level_orders) {
             if (order.remaining == 0) break;
-            if (resting.remaining == 0) continue;
+            if (resting->remaining == 0) continue;
 
-            uint64_t exec_qty = std::min(order.remaining, resting.remaining);
-            execute_trade(order, resting, exec_qty, trades);
+            uint64_t exec_qty = std::min(order.remaining, resting->remaining);
+            execute_trade(order, *resting, exec_qty, trades);
         }
 
-        level_orders.remove_if([](const Order& o) { return o.is_filled(); });
+        // Collect filled pointers before removing, then deallocate
+        std::vector<Order*> filled;
+        level_orders.remove_if([&filled](Order* o) {
+            if (o->is_filled()) { filled.push_back(o); return true; }
+            return false;
+        });
+        for (Order* o : filled) pool_.deallocate(o);
 
         if (level_orders.empty())
             levels.erase(it);

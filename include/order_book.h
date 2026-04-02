@@ -1,5 +1,6 @@
 #pragma once
 #include "order.h"
+#include "order_pool.h"
 #include "lock_policy.h"
 #include <map>
 #include <unordered_map>
@@ -7,10 +8,13 @@
 #include <list>
 #include <atomic>
 
+static constexpr std::size_t DEFAULT_POOL_CAPACITY = 1'000'000;
+
 template <typename LockPolicy = SharedMutexPolicy>
 class OrderBook {
 public:
-    OrderBook() = default;
+    explicit OrderBook(std::size_t pool_capacity = DEFAULT_POOL_CAPACITY)
+        : pool_(pool_capacity) {}
 
     AddResult add_order(const Order& order);
     bool cancel_order(uint64_t order_id);
@@ -24,10 +28,12 @@ public:
 
 private:
     mutable typename LockPolicy::mutex_type mtx_;
+    OrderPool pool_;
 
-    std::map<uint64_t, std::list<Order>> bids_;
-    std::map<uint64_t, std::list<Order>> asks_;
-    std::unordered_map<uint64_t, Order*> orders_;
+    // Price levels store pointers into pool-managed Order objects
+    std::map<uint64_t, std::list<Order*>> bids_;
+    std::map<uint64_t, std::list<Order*>> asks_;
+    std::unordered_map<uint64_t, Order*>  orders_;
 
     static std::atomic<uint64_t> next_trade_id_;
 
