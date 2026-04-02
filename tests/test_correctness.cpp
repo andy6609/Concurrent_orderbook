@@ -1,4 +1,5 @@
 #include "order_book.h"
+#include "order_pool.h"
 #include <iostream>
 #include <cassert>
 #include <thread>
@@ -379,6 +380,103 @@ void test_fok_kill() {
 }
 
 // ============================================================
+// OrderPool tests
+// ============================================================
+
+void test_order_pool_basic() {
+    std::cout << "[TEST] OrderPool — basic allocate/deallocate\n";
+
+    OrderPool pool(16);
+    assert(pool.capacity() == 16);
+    assert(pool.size() == 0);
+
+    Order o = Order::Limit(1, 1, Side::BUY, 100, 10);
+    Order* ptr = pool.allocate(o);
+    assert(ptr != nullptr);
+    assert(ptr->id == 1);
+    assert(ptr->price == 100);
+    assert(pool.size() == 1);
+
+    pool.deallocate(ptr);
+    assert(pool.size() == 0);
+
+    // Slot should be reusable
+    Order* ptr2 = pool.allocate(o);
+    assert(ptr2 != nullptr);
+    pool.deallocate(ptr2);
+
+    std::cout << "  PASSED\n";
+}
+
+void test_order_pool_fill_and_exhaust() {
+    std::cout << "[TEST] OrderPool — fill to capacity then reject\n";
+
+    const std::size_t CAP = 8;
+    OrderPool pool(CAP);
+
+    std::vector<Order*> ptrs;
+    for (std::size_t i = 0; i < CAP; ++i) {
+        Order o = Order::Limit(i + 1, 1, Side::SELL, 200, 5);
+        Order* p = pool.allocate(o);
+        assert(p != nullptr);
+        assert(p->id == i + 1);
+        ptrs.push_back(p);
+    }
+    assert(pool.size() == CAP);
+
+    // One more should return nullptr
+    Order extra = Order::Limit(99, 1, Side::BUY, 100, 1);
+    assert(pool.allocate(extra) == nullptr);
+
+    // Deallocate all and verify pool is empty
+    for (Order* p : ptrs) pool.deallocate(p);
+    assert(pool.size() == 0);
+
+    // Should be fully usable again
+    Order* fresh = pool.allocate(extra);
+    assert(fresh != nullptr);
+    pool.deallocate(fresh);
+
+    std::cout << "  PASSED\n";
+}
+
+void test_order_pool_slot_independence() {
+    std::cout << "[TEST] OrderPool — slots are independent (no aliasing)\n";
+
+    OrderPool pool(4);
+
+    Order a = Order::Limit(1, 1, Side::BUY,  100, 10);
+    Order b = Order::Limit(2, 1, Side::SELL, 200, 20);
+    Order* pa = pool.allocate(a);
+    Order* pb = pool.allocate(b);
+
+    assert(pa != pb);
+    assert(pa->id == 1 && pa->price == 100);
+    assert(pb->id == 2 && pb->price == 200);
+
+    // Modifying one must not affect the other
+    pa->remaining = 5;
+    assert(pb->remaining == 20);
+
+    pool.deallocate(pa);
+    pool.deallocate(pb);
+
+    std::cout << "  PASSED\n";
+}
+
+void run_pool_tests() {
+    std::cout << "========================================\n";
+    std::cout << "Testing: OrderPool\n";
+    std::cout << "========================================\n\n";
+
+    test_order_pool_basic();
+    test_order_pool_fill_and_exhaust();
+    test_order_pool_slot_independence();
+
+    std::cout << "\nAll OrderPool tests PASSED.\n\n";
+}
+
+// ============================================================
 // Run all tests for a given policy
 // ============================================================
 
@@ -411,6 +509,8 @@ void run_all_tests(const std::string& label) {
 }
 
 int main() {
+    run_pool_tests();
+
     run_all_tests<MutexPolicy>("MutexPolicy");
     run_all_tests<SharedMutexPolicy>("SharedMutexPolicy");
 

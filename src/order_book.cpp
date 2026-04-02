@@ -15,10 +15,12 @@ AddResult OrderBook<LP>::add_order(const Order& order) {
 
     std::vector<Trade> trades;
 
-    if (order.type == OrderType::LIMIT)
+    if (order.type == OrderType::LIMIT) {
         add_limit_order(order, trades);
-    else
-        match_market_order(order, trades);
+    } else {
+        Order working = order;
+        match_market_order(working, trades);
+    }
 
     return {true, std::move(trades)};
 }
@@ -93,10 +95,10 @@ void OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trad
         crosses = (order.price <= bids_.rbegin()->first);
 
     if (!crosses) {
-        // FOK with no crossing — immediately reject (can't fill at all)
-        if (order.tif == TimeInForce::FOK)
+        // IOC/FOK with no crossing — immediately cancel (nothing to fill)
+        if (order.tif == TimeInForce::IOC || order.tif == TimeInForce::FOK)
             return;
-        // No crossing — just rest in the book
+        // GTC: rest in the book
         auto& levels = (order.side == Side::BUY) ? bids_ : asks_;
         auto& level_orders = levels[order.price];
         level_orders.push_back(order);
@@ -138,7 +140,7 @@ void OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trad
 }
 
 template <typename LP>
-void OrderBook<LP>::match_market_order(Order order, std::vector<Trade>& trades) {
+void OrderBook<LP>::match_market_order(Order& order, std::vector<Trade>& trades) {
     // BUY matches against asks (cheapest first = begin)
     // SELL matches against bids (most expensive first = rbegin)
     bool is_buy = (order.side == Side::BUY);
