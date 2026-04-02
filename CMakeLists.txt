@@ -11,6 +11,7 @@ include_directories(include)
 add_library(orderbook
     src/order_book.cpp
     src/order_pool.cpp
+    src/sharded_order_book.cpp
 )
 
 # Test executable
