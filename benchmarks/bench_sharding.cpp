@@ -1,6 +1,8 @@
 #include "order_book.h"
 #include "sharded_order_book.h"
 #include <thread>
+#include <fstream>
+#include <filesystem>
 #include <vector>
 #include <chrono>
 #include <iostream>
@@ -98,6 +100,8 @@ int main() {
 
     const int N_SYMBOLS = 4;
 
+    std::vector<Result> results;
+
     for (int tc : THREAD_COUNTS) {
         std::cout << "--- " << tc << " thread(s) ---\n";
 
@@ -113,8 +117,9 @@ int main() {
             for (auto& th : threads) th.join();
             auto t1 = std::chrono::high_resolution_clock::now();
             double el = std::chrono::duration<double>(t1 - t0).count();
-            auto r = aggregate("Single book (1 symbol, 1 lock)", 1, tc, lats, el);
-            std::cout << "  [" << r.label << "] tput=" << r.throughput_ops_per_sec
+            auto r = aggregate("single", 1, tc, lats, el);
+            results.push_back(r);
+            std::cout << "  [single] tput=" << r.throughput_ops_per_sec
                       << " ops/s | avg=" << r.avg_ns << " ns | p99=" << r.p99_ns << " ns\n";
         }
 
@@ -130,11 +135,22 @@ int main() {
             for (auto& th : threads) th.join();
             auto t1 = std::chrono::high_resolution_clock::now();
             double el = std::chrono::duration<double>(t1 - t0).count();
-            auto r = aggregate("Sharded (4 symbols, 4 locks)", N_SYMBOLS, tc, lats, el);
-            std::cout << "  [" << r.label << "] tput=" << r.throughput_ops_per_sec
+            auto r = aggregate("sharded", N_SYMBOLS, tc, lats, el);
+            results.push_back(r);
+            std::cout << "  [sharded] tput=" << r.throughput_ops_per_sec
                       << " ops/s | avg=" << r.avg_ns << " ns | p99=" << r.p99_ns << " ns\n";
         }
         std::cout << "\n";
     }
+
+    // ── CSV output ────────────────────────────────────────────────────────────
+    std::filesystem::create_directories("results");
+    std::ofstream csv("results/sharding_results.csv");
+    csv << "mode,n_symbols,threads,throughput_ops_per_sec,avg_latency_ns,p99_latency_ns\n";
+    for (const auto& r : results)
+        csv << r.label << "," << r.n_symbols << "," << r.threads << ","
+            << r.throughput_ops_per_sec << "," << r.avg_ns << "," << r.p99_ns << "\n";
+    std::cout << "Results saved -> results/sharding_results.csv\n";
+
     return 0;
 }

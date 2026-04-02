@@ -1,6 +1,8 @@
 #include "order_book.h"
 #include "order_pool.h"
 #include <chrono>
+#include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <numeric>
 #include <random>
@@ -138,6 +140,18 @@ int main() {
     double speedup = static_cast<double>(r_pool.throughput_ops_per_sec)
                    / static_cast<double>(r_naive.throughput_ops_per_sec);
     std::cout << "Pool speedup: " << speedup << "x\n";
+
+    // ── CSV output ────────────────────────────────────────────────────────────
+    std::filesystem::create_directories("results");
+    std::ofstream csv("results/pool_results.csv");
+    csv << "allocator,n_orders,throughput_ops_per_sec,avg_latency_ns,p99_latency_ns\n";
+    for (const auto& r : {r_pool, r_naive}) {
+        csv << r.label << "," << N_ORDERS << ","
+            << r.throughput_ops_per_sec << ","
+            << r.avg_ns << ","
+            << r.p99_ns << "\n";
+    }
+    std::cout << "Results saved -> results/pool_results.csv\n";
 
     return 0;
 }
