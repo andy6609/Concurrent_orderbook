@@ -1,5 +1,6 @@
 #include "order_book.h"
 #include "order_pool.h"
+#include "sharded_order_book.h"
 #include <iostream>
 #include <cassert>
 #include <thread>
@@ -464,6 +465,96 @@ void test_order_pool_slot_independence() {
     std::cout << "  PASSED\n";
 }
 
+// ============================================================
+// ShardedOrderBook tests
+// ============================================================
+
+void test_sharded_basic_routing() {
+    std::cout << "[TEST] ShardedOrderBook — per-symbol routing\n";
+    ShardedOrderBook<MutexPolicy> shard(1000);
+
+    // Symbol 1: BUY
+    assert(shard.add_order(Order::Limit(1, 1, Side::BUY, 100, 10)).accepted);
+    // Symbol 2: SELL
+    assert(shard.add_order(Order::Limit(2, 2, Side::SELL, 200, 5)).accepted);
+
+    assert(shard.best_bid_price(1) == 100);
+    assert(shard.best_ask_price(2) == 200);
+
+    // Symbol 1 has no asks, symbol 2 has no bids
+    assert(shard.best_ask_price(1) == std::nullopt);
+    assert(shard.best_bid_price(2) == std::nullopt);
+
+    assert(shard.symbol_count() == 2);
+    std::cout << "  PASSED\n";
+}
+
+void test_sharded_symbol_isolation() {
+    std::cout << "[TEST] ShardedOrderBook — symbols don't interfere\n";
+    ShardedOrderBook<MutexPolicy> shard(1000);
+
+    // Same order IDs across different symbols (should both be accepted)
+    assert(shard.add_order(Order::Limit(1, 1, Side::BUY, 100, 10)).accepted);
+    assert(shard.add_order(Order::Limit(1, 2, Side::BUY, 110, 10)).accepted);
+
+    // Cancel on symbol 1 must not affect symbol 2
+    assert(shard.cancel_order(1, 1) == true);
+    assert(shard.best_bid_price(1) == std::nullopt);
+    assert(shard.best_bid_price(2) == 110);  // symbol 2 unchanged
+
+    std::cout << "  PASSED\n";
+}
+
+void test_sharded_cancel_unknown_symbol() {
+    std::cout << "[TEST] ShardedOrderBook — cancel on unknown symbol returns false\n";
+    ShardedOrderBook<MutexPolicy> shard(1000);
+
+    assert(shard.cancel_order(99, 1) == false);
+    assert(shard.best_bid_price(99) == std::nullopt);
+
+    std::cout << "  PASSED\n";
+}
+
+void test_sharded_concurrent() {
+    std::cout << "[TEST] ShardedOrderBook — concurrent multi-symbol throughput\n";
+    ShardedOrderBook<MutexPolicy> shard(100'000);
+
+    const int N_SYMBOLS = 4;
+    const int OPS_PER   = 5000;
+    std::atomic<uint64_t> next_id{1};
+
+    std::vector<std::thread> threads;
+    for (int sym = 1; sym <= N_SYMBOLS; ++sym) {
+        threads.emplace_back([&, sym]() {
+            for (int i = 0; i < OPS_PER; ++i) {
+                uint64_t id = next_id.fetch_add(1);
+                shard.add_order(Order::Limit(id, static_cast<uint32_t>(sym),
+                                             Side::BUY, 100 + (i % 10), 1));
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    // All symbols should have orders
+    for (int sym = 1; sym <= N_SYMBOLS; ++sym)
+        assert(shard.best_bid_price(static_cast<uint32_t>(sym)).has_value());
+
+    std::cout << "  PASSED (no crash, all symbols populated)\n";
+}
+
+void run_sharded_tests() {
+    std::cout << "========================================\n";
+    std::cout << "Testing: ShardedOrderBook\n";
+    std::cout << "========================================\n\n";
+
+    test_sharded_basic_routing();
+    test_sharded_symbol_isolation();
+    test_sharded_cancel_unknown_symbol();
+    test_sharded_concurrent();
+
+    std::cout << "\nAll ShardedOrderBook tests PASSED.\n\n";
+}
+
 void run_pool_tests() {
     std::cout << "========================================\n";
     std::cout << "Testing: OrderPool\n";
@@ -509,6 +600,7 @@ void run_all_tests(const std::string& label) {
 }
 
 int main() {
+    run_sharded_tests();
     run_pool_tests();
 
     run_all_tests<MutexPolicy>("MutexPolicy");
