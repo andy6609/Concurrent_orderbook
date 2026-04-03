@@ -31,6 +31,11 @@ add_executable(bench_pool
 )
 target_link_libraries(bench_pool orderbook pthread)
 
+add_executable(bench_sharding
+    benchmarks/bench_sharding.cpp
+)
+target_link_libraries(bench_sharding orderbook pthread)
+
 # Enable warnings
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(orderbook PRIVATE -Wall -Wextra -Wpedantic)
