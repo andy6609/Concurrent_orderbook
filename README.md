@@ -15,6 +15,14 @@ Two branches tell the story:
 
 ---
 
+## TL;DR
+
+- Built a C++17 matching engine to benchmark `std::mutex` vs `std::shared_mutex` under real contention
+- Discovered `shared_mutex` was **3.6× slower** due to atomic reader-count overhead dominating short critical sections
+- Developed v2 with a custom memory pool and per-symbol sharding — achieving **8.9× throughput improvement** and **2.4× gain at 8 threads**
+
+---
+
 ## v1: The Hypothesis That Didn't Hold
 
 The setup was straightforward: the same order book logic compiled against two lock
