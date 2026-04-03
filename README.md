@@ -163,37 +163,27 @@ Price-time priority throughout: best price wins, ties broken by arrival order.
 
 ---
 
-## Troubleshooting: The Dangling Pointer That Taught Me to Copy First
+## A Bug Worth Noting
 
-During development, `test_cancel_updates_best_price` was failing intermittently.
-Cancelling the best-priced order and then querying `best_bid_price()` returned the
-wrong level — sometimes the right price, sometimes garbage.
-
-The root cause was a use-after-free in `cancel_order`. The code retrieved a pointer
-from the `orders_` map, then passed it into `remove_if`, which destroyed the list
-node. The pointer was dangling by the time the next line read `order_ptr->price` to
-erase the now-empty price level. In practice it read stale memory and erased the
-wrong level.
+During v1 development, `test_cancel_updates_best_price` caught a use-after-free in
+`cancel_order`. The fix is a one-liner — copy `order_ptr->price` to a local variable
+before calling `remove_if`, which destroys the node the pointer was pointing into.
 
 ```cpp
-// broken — order_ptr dangling after remove_if destroys the node
+// before
 level_orders.remove_if([order_id](const Order& o) { return o.id == order_id; });
 if (level_orders.empty())
-    levels.erase(order_ptr->price);  // UB: order_ptr just got freed
+    levels.erase(order_ptr->price);  // order_ptr is dangling here
 
-// fixed — copy price before remove_if touches the list
+// after
 uint64_t price = order_ptr->price;
 level_orders.remove_if([order_id](const Order& o) { return o.id == order_id; });
 if (level_orders.empty())
     levels.erase(price);
 ```
 
-The original four tests all called `cancel_order` but none queried `best_bid_price()`
-afterward on a multi-level book, so the observable effect was never triggered. The
-bug existed from the beginning; it just had nowhere to surface. Adding the
-`test_cancel_updates_best_price` test exposed it immediately.
-
-This is documented in `docs/cancel_order_bug.md`.
+The original tests didn't catch it because none of them queried `best_bid_price()`
+after a cancel on a multi-level book. Details in `docs/cancel_order_bug.md`.
 
 ---
 
