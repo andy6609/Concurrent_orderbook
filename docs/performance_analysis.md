@@ -72,3 +72,62 @@ Fewer threads. The reader count contention is worst at high thread counts. At 2 
 - Artificially lengthening the critical section (e.g., add a dummy loop inside the lock) to find the crossover point where shared_mutex starts winning
 - A spinlock policy as a third comparison point
 - `perf stat` or Instruments profiling to see actual cache miss counts and context switches
+
+---
+
+## v2 Optimisations
+
+### Phase 2 — Memory Pool
+
+Every `list::push_back` in the original design called `operator new` internally,
+bouncing through the OS allocator and fragmenting heap memory over millions of
+orders. Phase 2 replaces this with a pre-allocated `OrderPool`: a contiguous
+array of Order-sized slots with an O(1) free-list.
+
+**Benchmark: OrderPool vs `std::list<Order>` (500k add + cancel, single thread)**
+
+| Allocator | Throughput | Avg latency | p99 latency |
+|---|---|---|---|
+| OrderPool (pre-allocated) | 863k ops/s | 1,158 ns | 11,416 ns |
+| Default (`std::list<Order>`) | 97k ops/s | 10,275 ns | 86,167 ns |
+| **Speedup** | **8.9×** | **8.9×** | **7.5×** |
+
+The 8.9× throughput gain comes almost entirely from eliminating OS allocator
+calls. `malloc` on macOS acquires a global arena lock and searches free lists
+on every call. The pool replaces this with a single array index pop — no OS
+call, no fragmentation, contiguous memory for better cache behaviour.
+
+### Phase 3 — Per-Symbol Sharding
+
+A single global OrderBook forces all symbols through one lock. As thread count
+grows, threads pile up waiting for that lock even when they're working on
+completely unrelated symbols.
+
+`ShardedOrderBook` maps each `symbol_id` to its own `OrderBook`, each with its
+own independent lock. Threads on different symbols never block each other.
+
+**Benchmark: Single book vs ShardedOrderBook (4 symbols, 50k ops/thread)**
+
+| Threads | Single book (ops/s) | Sharded 4 symbols (ops/s) | Sharding gain |
+|---|---|---|---|
+| 1 | 1,125k | 827k | 0.73× (overhead from routing) |
+| 2 | 626k | 872k | 1.39× |
+| 4 | 514k | 913k | 1.78× |
+| 8 | 440k | 856k | 1.94× |
+
+Single-threaded: sharding adds a small routing cost (~25%) since there's no
+contention to avoid. As threads increase, the single book degrades sharply
+(440k ops/s at 8T — 60% worse than 1T), while the sharded book stays flat
+near its single-thread throughput. At 8 threads the sharding gain is nearly 2×.
+
+With more threads than symbols the gain would plateau; with more symbols
+(e.g. 8 symbols, 8 threads) the gain would be closer to linear.
+
+### Summary: v1 → v2 improvements
+
+| | v1 (single book, list<Order>) | v2 (pool + sharding) |
+|---|---|---|
+| Allocation | OS heap per order | Pre-allocated pool, O(1) |
+| Multi-symbol | Single lock for all | Per-symbol independent lock |
+| Pool speedup | — | ~9× on alloc/dealloc path |
+| Sharding gain (8T) | — | ~2× throughput |
