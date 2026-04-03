@@ -116,6 +116,8 @@ prefetchers can actually help.
 
 **Benchmark: 500k add + cancel operations, single thread**
 
+![Pool vs Default Allocator](results/pool_comparison.png)
+
 | Allocator | Throughput | Avg latency | p99 latency |
 |---|---|---|---|
 | OrderPool | 863k ops/s | 1,158 ns | 11,416 ns |
@@ -136,6 +138,8 @@ own independent lock. The routing layer uses double-checked locking to keep the
 common case (symbol already exists) on a shared read path.
 
 **Benchmark: 50k ops/thread, 4 symbols**
+
+![Sharding Comparison](results/sharding_comparison.png)
 
 | Threads | Single book (ops/s) | Sharded (ops/s) | Sharding gain |
 |---|---|---|---|
