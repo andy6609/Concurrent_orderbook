@@ -1,44 +1,83 @@
 # Concurrent Order Book
 
-A C++17 matching engine exploring lock policy, memory allocation, and horizontal scaling tradeoffs.
+A C++17 limit order book built to answer a question I kept second-guessing: does
+`std::shared_mutex` actually buy anything in a read-heavy matching engine, or is it
+overhead dressed up as optimization?
 
-The project has two branches:
-- **`main`** — original v1: lock policy comparison (mutex vs shared_mutex)
-- **`v2-upgrade`** — extended v2: full matching engine + memory pool + per-symbol sharding
+The short answer turned out to be uncomfortable. Then the follow-up question —
+*why* — led to a deeper investigation into memory allocation and lock contention
+that became v2.
 
-**v1 question:** When does `std::shared_mutex` actually outperform `std::mutex` in a contended order book?
+Two branches tell the story:
 
-**v2 additions:** Real limit-limit crossing with trade events, IOC/FOK order types, a pre-allocated memory pool (8.9× throughput gain), and per-symbol sharding (2× gain at 8 threads).
-
-**Short answer on locking:** On this setup (macOS, Apple Silicon), `std::mutex` won in every configuration. `shared_mutex` p99 latency exploded under contention — 99μs vs 30μs at 8 threads on a read-heavy workload. The shared_mutex fairness/reader-count overhead exceeded the benefit of concurrent reads.
+- **`main`** — v1: the original lock-policy experiment
+- **`v2-upgrade`** — v2: a full matching engine with memory pool and per-symbol sharding
 
 ---
 
-## Results
+## v1: The Hypothesis That Didn't Hold
+
+The setup was straightforward: the same order book logic compiled against two lock
+policies — `std::mutex` (exclusive) and `std::shared_mutex` (readers shared, writers
+exclusive) — then benchmarked across three workloads and four thread counts.
+
+I expected `shared_mutex` to pull ahead on read-heavy workloads. With 8 threads and
+95% reads, you'd theoretically have 7+ threads reading concurrently. That should be
+a landslide.
+
+It wasn't.
 
 ![Throughput Comparison](results/throughput_comparison.png)
 
 ![p99 Latency Comparison](results/p99_latency_comparison.png)
+
+*The p99 spike at 4–8 threads marks where lock overhead starts dominating actual work.
+shared_mutex's fairness machinery amplifies this far more than mutex.*
 
 ### Key numbers (8 threads)
 
 | Workload | mutex throughput | shared_mutex throughput | mutex p99 | shared_mutex p99 |
 |----------|-----------------|------------------------|-----------|------------------|
 | read_heavy (95/5) | 5.4M ops/sec | 1.5M ops/sec | 30 μs | 99 μs |
-| balanced (70/20/10) | 3.4M ops/sec | 1.1M ops/sec | 37 μs | 138 μs |
-| write_heavy (20/30/50) | 2.8M ops/sec | 1.1M ops/sec | 41 μs | 138 μs |
+| balanced | 3.4M ops/sec | 1.1M ops/sec | 37 μs | 138 μs |
+| write_heavy | 2.8M ops/sec | 1.1M ops/sec | 41 μs | 138 μs |
 
-### Why shared_mutex lost
+`shared_mutex` was 3.6× slower on throughput and 3.3× worse on p99. Every
+configuration. Every workload.
 
-The critical sections in this order book are short — `best_bid_price()` is a single `map::rbegin()` dereference. When the protected work is cheap, the lock's internal overhead dominates. `shared_mutex` maintains an atomic reader count and fairness logic that `mutex` doesn't need. Under high contention with many threads, that overhead compounds.
+### What's actually happening
 
-This is platform-dependent. Linux's `pthread_rwlock` implementation may behave differently, especially on NUMA hardware where reader scalability matters more. The result here is specific to macOS/Apple Silicon, which is part of the point: you have to measure.
+`best_bid_price()` does one thing: dereference `bids_.rbegin()`. That's 10–20 ns
+of real work. `std::shared_mutex` needs two atomic operations just to enter and exit
+a shared lock — an atomic increment of the reader count on entry, a decrement on
+release — plus memory barriers. When the lock overhead is the same order of
+magnitude as the protected work, reader concurrency stops being an advantage.
+
+There's also the reader-count contention that catches people off guard. Readers
+"don't block each other" in the sense that they can all hold the lock at once, but
+they're still all hammering the same atomic counter variable. At 8 threads in a tight
+loop, that cache line bounces between cores constantly.
+
+`std::mutex` on macOS uses `os_unfair_lock` — a single CAS, explicitly unfair (no
+turn-taking), zero reader-count machinery. When the critical section is short, that
+simplicity wins.
+
+This is platform-specific. Linux's `pthread_rwlock` might tell a different story,
+especially on NUMA systems where data locality and coherency costs are more
+pronounced. The real lesson is that locking intuition built on theory doesn't
+survive contact with actual hardware — you have to measure.
 
 ---
 
-## Architecture
+## v2: Chasing the Real Bottlenecks
 
-### v2 (current — `v2-upgrade` branch)
+After confirming the locking results, the more interesting question was: if the lock
+itself isn't the primary bottleneck, what is?
+
+Profiling pointed at two things: **heap allocation** on every order insertion, and
+**global lock contention** across unrelated symbols. v2 addresses both.
+
+### Architecture
 
 ```
 ShardedOrderBook<LockPolicy>
@@ -51,36 +90,110 @@ OrderBook<LockPolicy>
 └── orders_ : unordered_map<id, Order*>             // O(1) cancel lookup
 
 OrderPool
-├── slots_    : Slot[]    // contiguous array, sizeof(Order) each
-└── free_list_: size_t[]  // O(1) stack of available indices
+├── slots_    : Slot[]     // contiguous array, sizeof(Order) per slot
+└── free_list_: size_t[]   // O(1) stack of available indices
 ```
 
-### v1 (original — `main` branch)
+The v1 architecture for comparison:
 
 ```
 OrderBook<LockPolicy>
 ├── bids_   : map<price, list<Order>>   // owns Order objects directly
-├── asks_   : map<price, list<Order>>   // owns Order objects directly
-└── orders_ : unordered_map<id, Order*> // O(1) cancel lookup
+└── orders_ : unordered_map<id, Order*>
 ```
 
-Lock policy is a compile-time template parameter — same logic, only the lock type changes:
+### Custom Memory Pool (OrderPool)
 
-```cpp
-OrderBook<MutexPolicy>       // std::mutex — all ops exclusive
-OrderBook<SharedMutexPolicy> // std::shared_mutex — reads shared, writes exclusive
-```
+Every `list::push_back` in v1 called `operator new` internally. Over millions of
+orders, this scatters Order objects across heap memory — terrible for data locality
+and cache performance. It also means the OS allocator gets hit on every single order
+arrival, with all the global lock and free-list overhead that entails.
+
+The fix is a pre-allocated slab: a contiguous array of `sizeof(Order)` slots managed
+by an O(1) free-list. Allocation is a single array index pop; deallocation pushes the
+index back. No OS call, no fragmentation, and Orders land in adjacent memory where
+prefetchers can actually help.
+
+**Benchmark: 500k add + cancel operations, single thread**
+
+| Allocator | Throughput | Avg latency | p99 latency |
+|---|---|---|---|
+| OrderPool | 863k ops/s | 1,158 ns | 11,416 ns |
+| `std::list<Order>` default | 97k ops/s | 10,275 ns | 86,167 ns |
+| **Speedup** | **8.9×** | **8.9×** | **7.5×** |
+
+The gain is almost entirely from eliminating allocator calls. The cache locality
+improvement on top of that is harder to isolate but shows up in the p99 numbers.
+
+### Per-Symbol Sharding (ShardedOrderBook)
+
+A single global OrderBook serialises all symbols through one lock. In a real
+exchange scenario with dozens of symbols, threads working on AAPL and TSLA have
+no logical reason to block each other — but they do, because they share a lock.
+
+`ShardedOrderBook` lazily creates a separate `OrderBook` per symbol, each with its
+own independent lock. The routing layer uses double-checked locking to keep the
+common case (symbol already exists) on a shared read path.
+
+**Benchmark: 50k ops/thread, 4 symbols**
+
+| Threads | Single book (ops/s) | Sharded (ops/s) | Sharding gain |
+|---|---|---|---|
+| 1 | 1,125k | 827k | 0.73× (routing overhead) |
+| 2 | 626k | 872k | 1.39× |
+| 4 | 514k | 913k | 1.78× |
+| 8 | 440k | 856k | 1.94× |
+
+At a single thread there's no contention to avoid, so sharding just adds routing
+overhead. As threads increase, the single book degrades sharply — down 61% from
+1T to 8T — while the sharded book stays nearly flat, within 4% of its
+single-thread peak. The trend suggests the gain would continue scaling with more
+symbols.
 
 ---
 
-## Order types (v2)
+## Order Types (v2)
 
-- **Limit GTC:** rests on the book at a specified price; matches aggressively if it crosses
-- **Limit IOC:** matches immediately, cancels any unfilled remainder (never rests)
-- **Limit FOK:** fills entirely in one shot or is cancelled — pre-checks available quantity
-- **Market:** matches immediately against resting orders, best price first
+- **Limit GTC** — rests on the book; matches aggressively if it crosses the spread
+- **Limit IOC** — fills immediately, cancels any unfilled remainder
+- **Limit FOK** — full-quantity or nothing; pre-checks available depth before matching
+- **Market** — crosses the book immediately, best price first
 
-Price-time priority: best price first, FIFO within the same price level.
+Price-time priority throughout: best price wins, ties broken by arrival order.
+
+---
+
+## Troubleshooting: The Dangling Pointer That Taught Me to Copy First
+
+During development, `test_cancel_updates_best_price` was failing intermittently.
+Cancelling the best-priced order and then querying `best_bid_price()` returned the
+wrong level — sometimes the right price, sometimes garbage.
+
+The root cause was a use-after-free in `cancel_order`. The code retrieved a pointer
+from the `orders_` map, then passed it into `remove_if`, which destroyed the list
+node. The pointer was dangling by the time the next line read `order_ptr->price` to
+erase the now-empty price level. In practice it read stale memory and erased the
+wrong level.
+
+```cpp
+// broken — order_ptr dangling after remove_if destroys the node
+level_orders.remove_if([order_id](const Order& o) { return o.id == order_id; });
+if (level_orders.empty())
+    levels.erase(order_ptr->price);  // UB: order_ptr just got freed
+
+// fixed — copy price before remove_if touches the list
+uint64_t price = order_ptr->price;
+level_orders.remove_if([order_id](const Order& o) { return o.id == order_id; });
+if (level_orders.empty())
+    levels.erase(price);
+```
+
+The original four tests all called `cancel_order` but none queried `best_bid_price()`
+afterward on a multi-level book, so the observable effect was never triggered. The
+bug existed from the beginning; it just had nowhere to surface. Adding the
+`test_cancel_updates_best_price` test exposed it immediately.
+
+This is documented in `docs/cancel_order_bug.md`.
 
 ---
 
@@ -97,16 +210,16 @@ Requires C++17, CMake 3.10+, pthreads.
 ## Run
 
 ```bash
-./test_correctness    # all correctness tests (ShardedOrderBook, OrderPool, matching)
+./test_correctness    # correctness suite (OrderBook, OrderPool, ShardedOrderBook)
 ./bench_comparison    # mutex vs shared_mutex → results/benchmark_results.csv
 ./bench_pool          # OrderPool vs default allocator
 ./bench_sharding      # single book vs ShardedOrderBook across thread counts
-python3 scripts/plot_results.py   # generate graphs from bench_comparison CSV
+python3 scripts/plot_results.py   # generate charts from bench_comparison CSV
 ```
 
 ---
 
-## Correctness tests
+## Correctness Tests
 
 | Test | What it verifies |
 |------|-----------------|
@@ -114,42 +227,35 @@ python3 scripts/plot_results.py   # generate graphs from bench_comparison CSV
 | Price-time priority | FIFO within same price level |
 | Cancel order | Order removed; double-cancel returns false |
 | Market order matching | Crosses price levels, partial fills |
-| Partial fill | Resting order stays on book until fully consumed |
-| Multi-level cross | Market order sweeps multiple price levels in order |
+| Partial fill | Resting order stays until fully consumed |
+| Multi-level cross | Market order sweeps multiple levels in order |
 | Cancel nonexistent | Returns false, no crash |
-| Empty book queries | best_bid/ask return nullopt; total_orders returns 0 |
-| Cancel updates best price | Cancelling best-price order exposes next level |
-| Concurrent add + cancel | 4 threads, 40k ops — no crash, no deadlock |
-
-Both `OrderBook<MutexPolicy>` and `OrderBook<SharedMutexPolicy>` pass the same test suite.
-
----
-
-## Benchmark configuration
-
-- **Workloads:** read_heavy (95/5/0), balanced (70/20/10), write_heavy (20/30/50)
-- **Thread counts:** 1, 2, 4, 8
-- **Ops per thread:** 100,000
-- **Seed:** fixed (42) for reproducibility
-- **Metrics:** throughput (ops/sec), avg latency (ns), p99 latency (ns)
-- **Platform:** macOS, Apple Silicon
+| Empty book queries | best_bid/ask return nullopt |
+| Cancel updates best price | Cancelling best level exposes the next |
+| Concurrent add + cancel | 4 threads, 40k ops — no crash, consistent state |
+| Limit-limit crossing | Aggressive limit matches resting at resting price |
+| IOC partial/no fill | Remainder cancelled, order never rests |
+| FOK full fill / kill | Executes fully or not at all |
+| OrderPool alloc/dealloc | Slot reuse, capacity exhaustion, slot independence |
+| ShardedOrderBook routing | Per-symbol isolation, concurrent multi-symbol |
 
 ---
 
-## v2 benchmark highlights
+## What I'd Explore Next
 
-| Benchmark | Result |
-|---|---|
-| OrderPool vs heap alloc (500k orders) | **8.9× throughput**, 8.9× avg latency |
-| Sharding gain at 8 threads (4 symbols) | **1.94×** vs single global lock |
-| Single book degradation: 1T → 8T | −61% (lock contention) |
-| Sharded book degradation: 1T → 8T | −4% (near-flat) |
+The results here are specific to macOS/Apple Silicon. Running the same benchmarks
+on Linux x86 is the obvious next step — `pthread_rwlock` has a different
+implementation and NUMA systems have different cache coherency costs. I'd want to
+know whether `shared_mutex` ever recovers its theoretical advantage on that hardware.
 
-See `docs/performance_analysis.md` for full breakdown and analysis.
+On the architecture side, the sharded book still serialises within each symbol.
+The natural extension is a single-threaded matching core per symbol fed by a
+lock-free SPSC queue — eliminating locking entirely on the hot path and pushing
+synchronisation to the boundary between the network layer and the engine. That's a
+meaningfully different architecture and worth prototyping to see how the numbers
+change.
 
-## What I'd do next
-
-- Run on Linux (x86, NUMA) to see if shared_mutex or pool characteristics differ
-- Try a spinlock policy as a third lock comparison
-- Lock-free free-list in OrderPool to remove the last serialisation point
-- Longer critical sections (e.g., order validation, logging) where shared_mutex overhead is amortized
+The `OrderPool` free-list is currently protected by the `OrderBook`'s own lock, which
+is fine in practice but leaves a small design debt: the pool itself isn't thread-safe
+in isolation. Making it so with a lock-free CAS stack would decouple it properly and
+open the door to sharing a single pool across multiple books.
