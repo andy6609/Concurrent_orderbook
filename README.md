@@ -1,12 +1,16 @@
 # Concurrent Order Book
 
-A C++17 limit order book that compares mutex vs shared_mutex under contention.
+A C++17 matching engine exploring lock policy, memory allocation, and horizontal scaling tradeoffs.
 
-**Question:** When does `std::shared_mutex` actually outperform `std::mutex` in a contended order book?
+The project has two branches:
+- **`main`** — original v1: lock policy comparison (mutex vs shared_mutex)
+- **`v2-upgrade`** — extended v2: full matching engine + memory pool + per-symbol sharding
 
-**Method:** Same order book logic, two lock policies (`std::mutex` exclusive vs `std::shared_mutex` read-write), benchmarked across three workloads and four thread counts. Throughput and p99 latency measured per configuration.
+**v1 question:** When does `std::shared_mutex` actually outperform `std::mutex` in a contended order book?
 
-**Short answer:** On this setup (macOS, Apple Silicon), `std::mutex` won in every configuration. `shared_mutex` p99 latency exploded under contention — 99μs vs 30μs at 8 threads on a read-heavy workload. The shared_mutex fairness/reader-count overhead exceeded the benefit of concurrent reads.
+**v2 additions:** Real limit-limit crossing with trade events, IOC/FOK order types, a pre-allocated memory pool (8.9× throughput gain), and per-symbol sharding (2× gain at 8 threads).
+
+**Short answer on locking:** On this setup (macOS, Apple Silicon), `std::mutex` won in every configuration. `shared_mutex` p99 latency exploded under contention — 99μs vs 30μs at 8 threads on a read-heavy workload. The shared_mutex fairness/reader-count overhead exceeded the benefit of concurrent reads.
 
 ---
 
@@ -34,29 +38,47 @@ This is platform-dependent. Linux's `pthread_rwlock` implementation may behave d
 
 ## Architecture
 
+### v2 (current — `v2-upgrade` branch)
+
 ```
+ShardedOrderBook<LockPolicy>
+└── books_  : unordered_map<symbol_id, OrderBook>  // per-symbol, independent locks
+
 OrderBook<LockPolicy>
-├── bids_   : std::map<price, std::list<Order>>   // sorted desc for best bid
-├── asks_   : std::map<price, std::list<Order>>   // sorted asc for best ask
-└── orders_ : std::unordered_map<id, Order*>       // O(1) cancel lookup
+├── pool_   : OrderPool                             // pre-allocated contiguous slots
+├── bids_   : map<price, list<Order*>>              // pointers into pool
+├── asks_   : map<price, list<Order*>>              // pointers into pool
+└── orders_ : unordered_map<id, Order*>             // O(1) cancel lookup
+
+OrderPool
+├── slots_    : Slot[]    // contiguous array, sizeof(Order) each
+└── free_list_: size_t[]  // O(1) stack of available indices
 ```
 
-Lock policy is a compile-time template parameter:
+### v1 (original — `main` branch)
+
+```
+OrderBook<LockPolicy>
+├── bids_   : map<price, list<Order>>   // owns Order objects directly
+├── asks_   : map<price, list<Order>>   // owns Order objects directly
+└── orders_ : unordered_map<id, Order*> // O(1) cancel lookup
+```
+
+Lock policy is a compile-time template parameter — same logic, only the lock type changes:
 
 ```cpp
 OrderBook<MutexPolicy>       // std::mutex — all ops exclusive
 OrderBook<SharedMutexPolicy> // std::shared_mutex — reads shared, writes exclusive
 ```
 
-Same logic, same data structures, only the lock type changes. This ensures a fair comparison.
-
 ---
 
-## Order types
+## Order types (v2)
 
-- **Limit:** rests on the book at a specified price
+- **Limit GTC:** rests on the book at a specified price; matches aggressively if it crosses
+- **Limit IOC:** matches immediately, cancels any unfilled remainder (never rests)
+- **Limit FOK:** fills entirely in one shot or is cancelled — pre-checks available quantity
 - **Market:** matches immediately against resting orders, best price first
-- **Cancel:** removes a resting order by ID
 
 Price-time priority: best price first, FIFO within the same price level.
 
@@ -75,9 +97,11 @@ Requires C++17, CMake 3.10+, pthreads.
 ## Run
 
 ```bash
-./test_correctness    # correctness tests
-./bench_comparison    # mutex vs shared_mutex benchmark → results/benchmark_results.csv
-python3 scripts/plot_results.py   # generate graphs from CSV
+./test_correctness    # all correctness tests (ShardedOrderBook, OrderPool, matching)
+./bench_comparison    # mutex vs shared_mutex → results/benchmark_results.csv
+./bench_pool          # OrderPool vs default allocator
+./bench_sharding      # single book vs ShardedOrderBook across thread counts
+python3 scripts/plot_results.py   # generate graphs from bench_comparison CSV
 ```
 
 ---
@@ -112,9 +136,20 @@ Both `OrderBook<MutexPolicy>` and `OrderBook<SharedMutexPolicy>` pass the same t
 
 ---
 
+## v2 benchmark highlights
+
+| Benchmark | Result |
+|---|---|
+| OrderPool vs heap alloc (500k orders) | **8.9× throughput**, 8.9× avg latency |
+| Sharding gain at 8 threads (4 symbols) | **1.94×** vs single global lock |
+| Single book degradation: 1T → 8T | −61% (lock contention) |
+| Sharded book degradation: 1T → 8T | −4% (near-flat) |
+
+See `docs/performance_analysis.md` for full breakdown and analysis.
+
 ## What I'd do next
 
-- Run the same benchmark on Linux (x86, NUMA) to see if shared_mutex behaves differently
-- Try a spinlock policy for comparison
-- Symbol-level sharding with per-book locks
+- Run on Linux (x86, NUMA) to see if shared_mutex or pool characteristics differ
+- Try a spinlock policy as a third lock comparison
+- Lock-free free-list in OrderPool to remove the last serialisation point
 - Longer critical sections (e.g., order validation, logging) where shared_mutex overhead is amortized
