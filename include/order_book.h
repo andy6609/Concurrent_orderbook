@@ -33,7 +33,7 @@ private:
     // Price levels store pointers into pool-managed Order objects
     std::map<uint64_t, std::list<Order*>> bids_;
     std::map<uint64_t, std::list<Order*>> asks_;
-    std::unordered_map<uint64_t, Order*>  orders_;
+    std::unordered_map<uint64_t, std::list<Order*>::iterator> orders_;
 
     static std::atomic<uint64_t> next_trade_id_;
 

@@ -33,12 +33,13 @@ bool OrderBook<LP>::cancel_order(uint64_t order_id) {
     if (it == orders_.end())
         return false;
 
-    Order* order_ptr = it->second;
+    auto order_iter = it->second;
+    Order* order_ptr = *order_iter;
     uint64_t price = order_ptr->price;
     auto& levels = (order_ptr->side == Side::BUY) ? bids_ : asks_;
     auto& level_orders = levels[price];
 
-    level_orders.remove_if([order_id](Order* o) { return o->id == order_id; });
+    level_orders.erase(order_iter);
 
     if (level_orders.empty())
         levels.erase(price);
@@ -100,8 +101,7 @@ void OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trad
         // GTC: allocate from pool and rest in the book
         Order* slot = pool_.allocate(order);
         auto& level_orders = (order.side == Side::BUY ? bids_ : asks_)[order.price];
-        level_orders.push_back(slot);
-        orders_[order.id] = slot;
+        orders_[order.id] = level_orders.insert(level_orders.end(), slot);
         return;
     }
 
@@ -132,8 +132,7 @@ void OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trad
     if (working.remaining > 0) {
         Order* slot = pool_.allocate(working);
         auto& level_orders = (order.side == Side::BUY ? bids_ : asks_)[order.price];
-        level_orders.push_back(slot);
-        orders_[order.id] = slot;
+        orders_[order.id] = level_orders.insert(level_orders.end(), slot);
     }
 }
 
