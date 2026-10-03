@@ -172,37 +172,44 @@ void test_concurrent_add_cancel() {
 
     const int NUM_THREADS = 4;
     const int OPS_PER_THREAD = 10000;
-    std::atomic<uint64_t> next_id{1};
-
+    std::atomic<int> failures{0};
     std::vector<std::thread> threads;
 
-    // Half threads add, half cancel
+    // Add disjoint ID ranges concurrently so the exact final size is known.
     for (int t = 0; t < NUM_THREADS; ++t) {
         threads.emplace_back([&, t]() {
             for (int i = 0; i < OPS_PER_THREAD; ++i) {
-                if (t % 2 == 0) {
-                    uint64_t id = next_id.fetch_add(1);
-                    book.add_order(Order::Limit(id, 1, Side::BUY, 100 + (i % 10), 10));
-                } else {
-                    uint64_t id = next_id.load();
-                    if (id > 1) {
-                        book.cancel_order(id - 1);
-                    }
-                }
+                const uint64_t id = static_cast<uint64_t>(t) * OPS_PER_THREAD + i + 1;
+                if (!book.add_order(
+                        Order::Limit(id, 1, Side::BUY, 100 + (i % 10), 10)).accepted)
+                    failures.fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
-
     for (auto& t : threads) {
         t.join();
     }
+    assert(failures.load(std::memory_order_relaxed) == 0);
+    assert(book.total_orders() ==
+           static_cast<std::size_t>(NUM_THREADS * OPS_PER_THREAD));
 
-    // No crash, no assertion failure = thread safety holds
-    // Just verify book is in a consistent state
-    size_t orders = book.total_orders();
-    (void)orders;  // not checking exact count, just that it doesn't crash
+    threads.clear();
+    for (int t = 0; t < NUM_THREADS; ++t) {
+        threads.emplace_back([&, t]() {
+            for (int i = 0; i < OPS_PER_THREAD; ++i) {
+                const uint64_t id = static_cast<uint64_t>(t) * OPS_PER_THREAD + i + 1;
+                if (!book.cancel_order(id))
+                    failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+    assert(failures.load(std::memory_order_relaxed) == 0);
+    assert(book.total_orders() == 0);
 
-    std::cout << "  PASSED (no crash, consistent state)\n";
+    std::cout << "  PASSED (40k adds + 40k cancels, exact counts verified)\n";
 }
 
 // ============================================================
@@ -293,6 +300,117 @@ void test_limit_limit_no_crossing() {
     assert(book.total_orders() == 2);
     assert(book.best_bid_price() == 90);
     assert(book.best_ask_price() == 100);
+
+    std::cout << "  PASSED\n";
+}
+
+template <typename LP>
+void test_buy_limit_stops_at_limit_price() {
+    std::cout << "[TEST] BUY limit never executes above its limit price\n";
+    OrderBook<LP> book;
+
+    book.add_order(Order::Limit(1, 1, Side::SELL, 100, 5));
+    book.add_order(Order::Limit(2, 1, Side::SELL, 110, 5));
+
+    auto result = book.add_order(
+        Order::Limit(3, 1, Side::BUY, 100, 10, TimeInForce::IOC));
+
+    assert(result.accepted);
+    assert(result.trades.size() == 1);
+    assert(result.trades[0].price == 100);
+    assert(result.trades[0].quantity == 5);
+    assert(book.total_orders() == 1);
+    assert(book.best_ask_price() == 110);
+
+    std::cout << "  PASSED\n";
+}
+
+template <typename LP>
+void test_sell_limit_stops_at_limit_price() {
+    std::cout << "[TEST] SELL limit never executes below its limit price\n";
+    OrderBook<LP> book;
+
+    book.add_order(Order::Limit(1, 1, Side::BUY, 90, 5));
+    book.add_order(Order::Limit(2, 1, Side::BUY, 100, 5));
+
+    auto result = book.add_order(
+        Order::Limit(3, 1, Side::SELL, 100, 10, TimeInForce::IOC));
+
+    assert(result.accepted);
+    assert(result.trades.size() == 1);
+    assert(result.trades[0].price == 100);
+    assert(result.trades[0].quantity == 5);
+    assert(book.total_orders() == 1);
+    assert(book.best_bid_price() == 90);
+
+    std::cout << "  PASSED\n";
+}
+
+template <typename LP>
+void test_sell_fok_checks_bids_in_best_price_order() {
+    std::cout << "[TEST] SELL FOK scans executable bids from best to worst\n";
+    OrderBook<LP> book;
+
+    book.add_order(Order::Limit(1, 1, Side::BUY, 80, 5));
+    book.add_order(Order::Limit(2, 1, Side::BUY, 100, 5));
+
+    auto result = book.add_order(
+        Order::Limit(3, 1, Side::SELL, 90, 5, TimeInForce::FOK));
+
+    assert(result.accepted);
+    assert(result.trades.size() == 1);
+    assert(result.trades[0].price == 100);
+    assert(book.total_orders() == 1);
+    assert(book.best_bid_price() == 80);
+
+    std::cout << "  PASSED\n";
+}
+
+template <typename LP>
+void test_pool_exhaustion_rejects_atomically() {
+    std::cout << "[TEST] Pool exhaustion rejects GTC order atomically\n";
+    OrderBook<LP> book(1);
+
+    assert(book.add_order(Order::Limit(1, 1, Side::BUY, 100, 5)).accepted);
+    auto result = book.add_order(Order::Limit(2, 1, Side::BUY, 99, 5));
+
+    assert(!result.accepted);
+    assert(result.trades.empty());
+    assert(book.total_orders() == 1);
+    assert(book.best_bid_price() == 100);
+
+    std::cout << "  PASSED\n";
+}
+
+template <typename LP>
+void test_full_pool_accepts_fully_marketable_order() {
+    std::cout << "[TEST] Full pool accepts order that needs no resting slot\n";
+    OrderBook<LP> book(1);
+
+    assert(book.add_order(Order::Limit(1, 1, Side::SELL, 100, 5)).accepted);
+    auto result = book.add_order(Order::Limit(2, 1, Side::BUY, 100, 5));
+
+    assert(result.accepted);
+    assert(result.trades.size() == 1);
+    assert(book.total_orders() == 0);
+
+    std::cout << "  PASSED\n";
+}
+
+template <typename LP>
+void test_full_pool_accepts_partial_cross_that_frees_slot() {
+    std::cout << "[TEST] Full pool accepts partial cross when matching frees a slot\n";
+    OrderBook<LP> book(1);
+
+    assert(book.add_order(Order::Limit(1, 1, Side::SELL, 100, 5)).accepted);
+    auto result = book.add_order(Order::Limit(2, 1, Side::BUY, 100, 10));
+
+    assert(result.accepted);
+    assert(result.trades.size() == 1);
+    assert(result.trades[0].quantity == 5);
+    assert(book.total_orders() == 1);
+    assert(book.best_bid_price() == 100);
+    assert(book.best_ask_price() == std::nullopt);
 
     std::cout << "  PASSED\n";
 }
@@ -591,6 +709,12 @@ void run_all_tests(const std::string& label) {
     test_limit_limit_crossing_partial<LP>();
     test_limit_limit_crossing_multi_level<LP>();
     test_limit_limit_no_crossing<LP>();
+    test_buy_limit_stops_at_limit_price<LP>();
+    test_sell_limit_stops_at_limit_price<LP>();
+    test_sell_fok_checks_bids_in_best_price_order<LP>();
+    test_pool_exhaustion_rejects_atomically<LP>();
+    test_full_pool_accepts_fully_marketable_order<LP>();
+    test_full_pool_accepts_partial_cross_that_frees_slot<LP>();
     test_ioc_partial_fill<LP>();
     test_ioc_no_fill<LP>();
     test_fok_full_fill<LP>();

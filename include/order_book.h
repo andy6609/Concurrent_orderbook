@@ -37,8 +37,9 @@ private:
 
     static std::atomic<uint64_t> next_trade_id_;
 
-    void add_limit_order(const Order& order, std::vector<Trade>& trades);
-    void match_market_order(Order& order, std::vector<Trade>& trades);
+    bool add_limit_order(const Order& order, std::vector<Trade>& trades);
+    uint64_t executable_quantity(const Order& order) const;
+    void match_order(Order& order, std::vector<Trade>& trades);
     void execute_trade(Order& incoming, Order& resting, uint64_t exec_qty, std::vector<Trade>& trades);
 };
 

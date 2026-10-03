@@ -39,10 +39,14 @@ target_link_libraries(bench_sharding orderbook pthread)
 # Enable warnings
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(orderbook PRIVATE -Wall -Wextra -Wpedantic)
+    # The correctness suite currently uses assert(); keep checks active even
+    # when the test executable is built with -DCMAKE_BUILD_TYPE=Release.
+    target_compile_options(test_correctness PRIVATE -UNDEBUG)
+elseif(MSVC)
+    target_compile_options(test_correctness PRIVATE /UNDEBUG)
 endif()
 
 # Optimization for benchmarks
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     target_compile_options(orderbook PRIVATE -O3)
 endif()
-

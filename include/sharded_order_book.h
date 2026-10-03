@@ -5,8 +5,8 @@
 #include <shared_mutex>
 
 // ShardedOrderBook routes orders to per-symbol OrderBook instances.
-// Each symbol has its own independent lock, so threads working on different
-// symbols never contend — horizontal scaling with zero global locking.
+// Each symbol has its own independent book lock. The registry still has a short
+// shared-lock lookup on the common path.
 template <typename LockPolicy = MutexPolicy>
 class ShardedOrderBook {
 public:

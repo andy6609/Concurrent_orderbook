@@ -1,5 +1,6 @@
 #include "order_book.h"
 #include <algorithm>
+#include <stdexcept>
 
 // === Write operations ===
 
@@ -10,16 +11,20 @@ template <typename LP>
 AddResult OrderBook<LP>::add_order(const Order& order) {
     typename LP::write_lock lk(mtx_);
 
+    if (order.quantity == 0 || order.remaining == 0 || order.remaining > order.quantity)
+        return {false, {}};
+
     if (orders_.find(order.id) != orders_.end())
         return {false, {}};
 
     std::vector<Trade> trades;
 
     if (order.type == OrderType::LIMIT) {
-        add_limit_order(order, trades);
+        if (!add_limit_order(order, trades))
+            return {false, {}};
     } else {
         Order working = order;
-        match_market_order(working, trades);
+        match_order(working, trades);
     }
 
     return {true, std::move(trades)};
@@ -86,58 +91,83 @@ size_t OrderBook<LP>::total_ask_levels() const {
 // === Internal (lock already held) ===
 
 template <typename LP>
-void OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trades) {
-    // Check if this order crosses the book (aggressive limit order)
-    bool crosses = false;
-    if (order.side == Side::BUY && !asks_.empty())
-        crosses = (order.price >= asks_.begin()->first);
-    else if (order.side == Side::SELL && !bids_.empty())
-        crosses = (order.price <= bids_.rbegin()->first);
+uint64_t OrderBook<LP>::executable_quantity(const Order& order) const {
+    uint64_t available = 0;
 
-    if (!crosses) {
-        // IOC/FOK with no crossing — immediately cancel (nothing to fill)
-        if (order.tif == TimeInForce::IOC || order.tif == TimeInForce::FOK)
-            return;
-        // GTC: allocate from pool and rest in the book
-        Order* slot = pool_.allocate(order);
-        auto& level_orders = (order.side == Side::BUY ? bids_ : asks_)[order.price];
-        orders_[order.id] = level_orders.insert(level_orders.end(), slot);
-        return;
-    }
-
-    // FOK: pre-check that enough quantity is available across all price levels
-    if (order.tif == TimeInForce::FOK) {
-        auto& opp_levels = (order.side == Side::BUY) ? asks_ : bids_;
-        uint64_t available = 0;
-        for (auto& [lvl_price, lvl_orders] : opp_levels) {
-            if (order.side == Side::BUY  && lvl_price > order.price) break;
-            if (order.side == Side::SELL && lvl_price < order.price) break;
-            for (Order* o : lvl_orders)
-                available += o->remaining;
-            if (available >= order.remaining) break;
+    auto add_level = [&](const std::list<Order*>& level_orders) {
+        for (const Order* resting : level_orders) {
+            // Saturate at the incoming quantity so the sum cannot overflow.
+            if (resting->remaining >= order.remaining - available) {
+                available = order.remaining;
+                return true;
+            }
+            available += resting->remaining;
         }
-        if (available < order.remaining)
-            return;  // Kill — not enough to fill entirely
+        return false;
+    };
+
+    if (order.side == Side::BUY) {
+        for (const auto& [price, level_orders] : asks_) {
+            if (price > order.price) break;
+            if (add_level(level_orders)) break;
+        }
+    } else {
+        for (auto it = bids_.rbegin(); it != bids_.rend(); ++it) {
+            if (it->first < order.price) break;
+            if (add_level(it->second)) break;
+        }
     }
 
-    // Aggressive — match first, then handle remainder based on TIF
-    Order working = order;
-    match_market_order(working, trades);
-
-    // IOC: cancel any unfilled remainder (never rests)
-    if (order.tif == TimeInForce::IOC)
-        return;
-
-    // GTC: rest whatever didn't fill
-    if (working.remaining > 0) {
-        Order* slot = pool_.allocate(working);
-        auto& level_orders = (order.side == Side::BUY ? bids_ : asks_)[order.price];
-        orders_[order.id] = level_orders.insert(level_orders.end(), slot);
-    }
+    return available;
 }
 
 template <typename LP>
-void OrderBook<LP>::match_market_order(Order& order, std::vector<Trade>& trades) {
+bool OrderBook<LP>::add_limit_order(const Order& order, std::vector<Trade>& trades) {
+    const uint64_t available = executable_quantity(order);
+
+    // FOK is accepted by the engine but produces no trades when the full quantity
+    // is not immediately executable at prices within the order's limit.
+    if (order.tif == TimeInForce::FOK && available < order.remaining)
+        return true;
+
+    // If no match can free capacity, reserve storage before doing any work. This
+    // makes pool exhaustion an atomic rejection with no book side effects.
+    Order* reserved_slot = nullptr;
+    const bool needs_resting_slot =
+        order.tif == TimeInForce::GTC && available < order.remaining;
+    if (needs_resting_slot && available == 0) {
+        reserved_slot = pool_.allocate(order);
+        if (reserved_slot == nullptr)
+            return false;
+    }
+
+    Order working = order;
+    if (available > 0)
+        match_order(working, trades);
+
+    // IOC and FOK never rest an unfilled remainder.
+    if (order.tif != TimeInForce::GTC)
+        return true;
+
+    if (working.remaining > 0) {
+        // If the order matched anything but still has a remainder, every
+        // executable resting order was consumed and at least one pool slot was
+        // freed. Otherwise the slot was reserved before matching.
+        if (reserved_slot == nullptr)
+            reserved_slot = pool_.allocate(working);
+        if (reserved_slot == nullptr)
+            throw std::logic_error(
+                "matching consumed liquidity but did not free a pool slot");
+        *reserved_slot = working;
+        auto& level_orders = (order.side == Side::BUY ? bids_ : asks_)[order.price];
+        orders_[order.id] = level_orders.insert(level_orders.end(), reserved_slot);
+    }
+
+    return true;
+}
+
+template <typename LP>
+void OrderBook<LP>::match_order(Order& order, std::vector<Trade>& trades) {
     // BUY matches against asks (cheapest first = begin)
     // SELL matches against bids (most expensive first = rbegin)
     bool is_buy = (order.side == Side::BUY);
@@ -145,6 +175,12 @@ void OrderBook<LP>::match_market_order(Order& order, std::vector<Trade>& trades)
 
     while (order.remaining > 0 && !levels.empty()) {
         auto it = is_buy ? levels.begin() : std::prev(levels.end());
+
+        if (order.type == OrderType::LIMIT) {
+            if (is_buy && it->first > order.price) break;
+            if (!is_buy && it->first < order.price) break;
+        }
+
         auto& level_orders = it->second;
 
         for (Order* resting : level_orders) {
@@ -191,3 +227,4 @@ void OrderBook<LP>::execute_trade(Order& incoming, Order& resting, uint64_t qty,
 // === Explicit Instantiation ===
 template class OrderBook<MutexPolicy>;
 template class OrderBook<SharedMutexPolicy>;
+template class OrderBook<ProcessWideMutexPolicy>;

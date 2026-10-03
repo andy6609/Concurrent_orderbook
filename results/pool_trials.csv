@@ -1,0 +1,15 @@
+allocator,trial,n_orders,throughput_ops_per_sec,p50_latency_ns,p99_latency_ns
+OrderPool,1,300000,14494971,42,250
+Heap new/delete,1,300000,11665312,42,208
+Heap new/delete,2,300000,13959169,42,208
+OrderPool,2,300000,19406118,42,167
+OrderPool,3,300000,21105209,42,125
+Heap new/delete,3,300000,15866981,42,125
+Heap new/delete,4,300000,15499603,42,250
+OrderPool,4,300000,18426150,42,208
+OrderPool,5,300000,15769209,42,125
+Heap new/delete,5,300000,14869166,42,167
+Heap new/delete,6,300000,15955643,42,208
+OrderPool,6,300000,19426303,42,125
+OrderPool,7,300000,19347973,42,250
+Heap new/delete,7,300000,15347754,42,167

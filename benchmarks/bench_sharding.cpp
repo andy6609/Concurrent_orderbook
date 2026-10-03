@@ -1,156 +1,306 @@
 #include "order_book.h"
 #include "sharded_order_book.h"
-#include <thread>
-#include <fstream>
-#include <filesystem>
-#include <vector>
-#include <chrono>
-#include <iostream>
-#include <atomic>
-#include <random>
-#include <numeric>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
-// ── Config ────────────────────────────────────────────────────────────────────
+using Clock = std::chrono::steady_clock;
+
 static constexpr int THREAD_COUNTS[] = {1, 2, 4, 8};
-static constexpr int OPS_PER_THREAD  = 50'000;
+static constexpr int OPS_PER_THREAD = 50'000;
+static constexpr int N_SYMBOLS = 4;
+static constexpr int N_TRIALS = 5;
 
-// ── Result ────────────────────────────────────────────────────────────────────
-struct Result {
-    const char* label;
-    int         n_symbols;
-    int         threads;
-    long        throughput_ops_per_sec;
-    long        avg_ns;
-    long        p99_ns;
+// Both benchmark sides own four independent books. This baseline makes their
+// lock policy delegate to one process-wide mutex; the sharded variant uses one
+// ordinary mutex per book.
+class GlobalLockedBooks {
+public:
+    explicit GlobalLockedBooks(std::size_t pool_capacity_per_symbol)
+        : pool_capacity_per_symbol_(pool_capacity_per_symbol) {}
+
+    void create_symbols() {
+        for (int symbol = 1; symbol <= N_SYMBOLS; ++symbol) {
+            books_.emplace(static_cast<uint32_t>(symbol),
+                           std::make_unique<OrderBook<ProcessWideMutexPolicy>>(
+                               pool_capacity_per_symbol_));
+        }
+    }
+
+    AddResult add_order(const Order& order) {
+        return books_.at(order.symbol_id)->add_order(order);
+    }
+
+private:
+    std::unordered_map<uint32_t,
+                       std::unique_ptr<OrderBook<ProcessWideMutexPolicy>>> books_;
+    std::size_t pool_capacity_per_symbol_;
 };
 
-// ── Single global OrderBook (all symbols on one book) ─────────────────────────
-static std::atomic<uint64_t> g_id{1};
+struct Operation {
+    uint64_t id;
+    uint32_t symbol;
+    uint64_t price;
+};
 
-void worker_single(ExclusiveOrderBook* book, int n_ops, int tid,
-                   std::vector<double>& latencies)
-{
-    std::mt19937 rng(static_cast<uint32_t>(tid) * 31337u);
-    std::uniform_int_distribution<uint64_t> price_dist(9900, 10100);
+struct Result {
+    std::string mode;
+    int trial;
+    int n_symbols;
+    int threads;
+    uint64_t throughput_ops_per_sec;
+    uint64_t p50_latency_ns;
+    uint64_t p99_latency_ns;
+};
 
-    latencies.reserve(n_ops);
-    for (int i = 0; i < n_ops; ++i) {
-        uint64_t id    = g_id.fetch_add(1, std::memory_order_relaxed);
-        uint64_t price = price_dist(rng);
-        Side     side  = (id % 2 == 0) ? Side::BUY : Side::SELL;
+std::vector<std::vector<Operation>> make_operations(int thread_count) {
+    std::vector<std::vector<Operation>> operations(thread_count);
+    for (int thread = 0; thread < thread_count; ++thread) {
+        auto& thread_ops = operations[thread];
+        thread_ops.reserve(OPS_PER_THREAD);
+        std::mt19937 rng(static_cast<uint32_t>(thread) * 31'337u + 42u);
+        std::uniform_int_distribution<uint64_t> price_dist(9'900, 10'100);
+        for (int i = 0; i < OPS_PER_THREAD; ++i) {
+            const uint64_t id = static_cast<uint64_t>(thread) * OPS_PER_THREAD + i + 1;
+            const uint32_t symbol = static_cast<uint32_t>((thread + i) % N_SYMBOLS + 1);
+            thread_ops.push_back(Operation{id, symbol, price_dist(rng)});
+        }
+    }
+    return operations;
+}
 
-        auto t0 = std::chrono::high_resolution_clock::now();
-        book->add_order(Order::Limit(id, 1, side, price, 10));
-        auto t1 = std::chrono::high_resolution_clock::now();
-        latencies.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count());
+template <typename Books>
+void execute_operations(Books& books,
+                        const std::vector<Operation>& operations,
+                        std::vector<uint64_t>* latency_samples,
+                        std::atomic<int>& failures) {
+    if (latency_samples != nullptr) latency_samples->reserve(operations.size());
+
+    for (const auto& operation : operations) {
+        const auto start = latency_samples != nullptr ? Clock::now() : Clock::time_point{};
+        const auto result = books.add_order(Order::Limit(
+            operation.id, operation.symbol, Side::BUY, operation.price, 10));
+        const auto end = latency_samples != nullptr ? Clock::now() : Clock::time_point{};
+
+        if (!result.accepted)
+            failures.fetch_add(1, std::memory_order_relaxed);
+        if (latency_samples != nullptr) {
+            latency_samples->push_back(static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
+        }
     }
 }
 
-void worker_sharded(ShardedOrderBook<MutexPolicy>* shard, int n_ops, int tid,
-                    int n_symbols, std::vector<double>& latencies)
-{
-    std::mt19937 rng(static_cast<uint32_t>(tid) * 31337u);
-    std::uniform_int_distribution<uint64_t> price_dist(9900, 10100);
-    std::uniform_int_distribution<uint32_t> sym_dist(1, static_cast<uint32_t>(n_symbols));
+template <typename Books>
+uint64_t measure_throughput(
+    Books& books,
+    const std::vector<std::vector<Operation>>& operations) {
+    std::vector<std::thread> workers;
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<int> failures{0};
 
-    latencies.reserve(n_ops);
-    for (int i = 0; i < n_ops; ++i) {
-        uint64_t  id     = g_id.fetch_add(1, std::memory_order_relaxed);
-        uint32_t  sym    = sym_dist(rng);
-        uint64_t  price  = price_dist(rng);
-        Side      side   = (id % 2 == 0) ? Side::BUY : Side::SELL;
-
-        auto t0 = std::chrono::high_resolution_clock::now();
-        shard->add_order(Order::Limit(id, sym, side, price, 10));
-        auto t1 = std::chrono::high_resolution_clock::now();
-        latencies.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count());
+    for (std::size_t thread = 0; thread < operations.size(); ++thread) {
+        workers.emplace_back([&, thread]() {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            execute_operations(books, operations[thread], nullptr, failures);
+        });
     }
+
+    while (ready.load(std::memory_order_acquire) != static_cast<int>(workers.size()))
+        std::this_thread::yield();
+    const auto wall_start = Clock::now();
+    start.store(true, std::memory_order_release);
+    for (auto& worker : workers) worker.join();
+    const auto wall_end = Clock::now();
+
+    if (failures.load(std::memory_order_relaxed) != 0)
+        throw std::runtime_error("throughput benchmark operation was rejected");
+
+    const uint64_t operation_count =
+        static_cast<uint64_t>(operations.size()) * OPS_PER_THREAD;
+    const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        wall_end - wall_start).count();
+    return static_cast<uint64_t>(
+        static_cast<long double>(operation_count) * 1'000'000'000.0L /
+        static_cast<long double>(elapsed_ns));
 }
 
-// ── Aggregation ───────────────────────────────────────────────────────────────
-Result aggregate(const char* label, int n_symbols, int n_threads,
-                 std::vector<std::vector<double>>& all_lat,
-                 double elapsed_s)
-{
-    std::vector<double> flat;
-    flat.reserve(static_cast<size_t>(n_threads) * OPS_PER_THREAD);
-    for (auto& v : all_lat) flat.insert(flat.end(), v.begin(), v.end());
+uint64_t percentile(const std::vector<uint64_t>& sorted_samples, double quantile) {
+    const auto index = static_cast<std::size_t>(
+        quantile * static_cast<double>(sorted_samples.size() - 1));
+    return sorted_samples[index];
+}
+
+template <typename Books>
+std::pair<uint64_t, uint64_t> measure_latency(
+    Books& books,
+    const std::vector<std::vector<Operation>>& operations) {
+    std::vector<std::thread> workers;
+    std::vector<std::vector<uint64_t>> samples(operations.size());
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<int> failures{0};
+
+    for (std::size_t thread = 0; thread < operations.size(); ++thread) {
+        workers.emplace_back([&, thread]() {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            execute_operations(books, operations[thread], &samples[thread], failures);
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) != static_cast<int>(workers.size()))
+        std::this_thread::yield();
+    start.store(true, std::memory_order_release);
+    for (auto& worker : workers) worker.join();
+
+    if (failures.load(std::memory_order_relaxed) != 0)
+        throw std::runtime_error("latency benchmark operation was rejected");
+
+    std::vector<uint64_t> flat;
+    flat.reserve(operations.size() * OPS_PER_THREAD);
+    for (const auto& thread_samples : samples)
+        flat.insert(flat.end(), thread_samples.begin(), thread_samples.end());
     std::sort(flat.begin(), flat.end());
-
-    double avg = std::accumulate(flat.begin(), flat.end(), 0.0) / flat.size();
-    double p99 = flat[flat.size() * 99 / 100];
-
-    Result r;
-    r.label                  = label;
-    r.n_symbols              = n_symbols;
-    r.threads                = n_threads;
-    r.throughput_ops_per_sec = static_cast<long>(flat.size() / elapsed_s);
-    r.avg_ns                 = static_cast<long>(avg);
-    r.p99_ns                 = static_cast<long>(p99);
-    return r;
+    return {percentile(flat, 0.50), percentile(flat, 0.99)};
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+std::unique_ptr<GlobalLockedBooks> make_global_books(std::size_t pool_capacity) {
+    auto books = std::make_unique<GlobalLockedBooks>(pool_capacity);
+    books->create_symbols();
+    return books;
+}
+
+std::unique_ptr<ShardedOrderBook<MutexPolicy>> make_sharded_books(
+    std::size_t pool_capacity) {
+    auto books = std::make_unique<ShardedOrderBook<MutexPolicy>>(pool_capacity);
+    // Pre-create registry entries outside the timed region.
+    for (int symbol = 1; symbol <= N_SYMBOLS; ++symbol) {
+        const uint64_t id = 1'000'000'000ULL + static_cast<uint64_t>(symbol);
+        books->add_order(Order::Limit(
+            id, static_cast<uint32_t>(symbol), Side::BUY, 1, 1));
+        books->cancel_order(static_cast<uint32_t>(symbol), id);
+    }
+    return books;
+}
+
+template <typename Factory>
+Result run_trial(const std::string& mode,
+                 int trial,
+                 int thread_count,
+                 const std::vector<std::vector<Operation>>& operations,
+                 Factory make_books) {
+    auto throughput_books = make_books();
+    const uint64_t throughput = measure_throughput(*throughput_books, operations);
+    throughput_books.reset();
+
+    auto latency_books = make_books();
+    const auto [p50, p99] = measure_latency(*latency_books, operations);
+    return Result{mode, trial, N_SYMBOLS, thread_count, throughput, p50, p99};
+}
+
+uint64_t median(std::vector<uint64_t> values) {
+    std::sort(values.begin(), values.end());
+    return values[values.size() / 2];
+}
+
+Result summarize(const std::string& mode,
+                 int thread_count,
+                 const std::vector<Result>& trials) {
+    std::vector<uint64_t> throughput;
+    std::vector<uint64_t> p50;
+    std::vector<uint64_t> p99;
+    for (const auto& result : trials) {
+        if (result.mode != mode || result.threads != thread_count) continue;
+        throughput.push_back(result.throughput_ops_per_sec);
+        p50.push_back(result.p50_latency_ns);
+        p99.push_back(result.p99_latency_ns);
+    }
+    return Result{mode, 0, N_SYMBOLS, thread_count, median(throughput),
+                  median(p50), median(p99)};
+}
+
 int main() {
-    std::cout << "========================================\n"
-              << "Benchmark: Single Book vs Sharded (4 symbols)\n"
-              << "ops_per_thread=" << OPS_PER_THREAD << "\n"
-              << "========================================\n\n";
+    std::cout << "Controlled sharding benchmark\n"
+              << "Four books on both sides; global mutex vs per-symbol mutexes\n"
+              << "Inputs generated outside timing; throughput and latency use separate books\n"
+              << "ops_per_thread=" << OPS_PER_THREAD << ", trials=" << N_TRIALS
+              << " (reported values are medians)\n\n";
 
-    const int N_SYMBOLS = 4;
+    std::vector<Result> trials;
+    std::vector<Result> summaries;
 
-    std::vector<Result> results;
+    for (int thread_count : THREAD_COUNTS) {
+        const auto operations = make_operations(thread_count);
+        const std::size_t pool_capacity =
+            static_cast<std::size_t>(thread_count) * OPS_PER_THREAD / N_SYMBOLS + 1'000;
 
-    for (int tc : THREAD_COUNTS) {
-        std::cout << "--- " << tc << " thread(s) ---\n";
+        for (int trial = 1; trial <= N_TRIALS; ++trial) {
+            auto global_factory = [pool_capacity]() {
+                return make_global_books(pool_capacity);
+            };
+            auto sharded_factory = [pool_capacity]() {
+                return make_sharded_books(pool_capacity);
+            };
 
-        // Single global book
-        {
-            g_id.store(1, std::memory_order_relaxed);
-            ExclusiveOrderBook single_book(static_cast<std::size_t>(tc) * OPS_PER_THREAD + 10);
-            std::vector<std::thread>         threads;
-            std::vector<std::vector<double>> lats(tc);
-            auto t0 = std::chrono::high_resolution_clock::now();
-            for (int t = 0; t < tc; ++t)
-                threads.emplace_back(worker_single, &single_book, OPS_PER_THREAD, t, std::ref(lats[t]));
-            for (auto& th : threads) th.join();
-            auto t1 = std::chrono::high_resolution_clock::now();
-            double el = std::chrono::duration<double>(t1 - t0).count();
-            auto r = aggregate("single", 1, tc, lats, el);
-            results.push_back(r);
-            std::cout << "  [single] tput=" << r.throughput_ops_per_sec
-                      << " ops/s | avg=" << r.avg_ns << " ns | p99=" << r.p99_ns << " ns\n";
+            if (trial % 2 == 1) {
+                trials.push_back(run_trial(
+                    "global", trial, thread_count, operations, global_factory));
+                trials.push_back(run_trial(
+                    "sharded", trial, thread_count, operations, sharded_factory));
+            } else {
+                trials.push_back(run_trial(
+                    "sharded", trial, thread_count, operations, sharded_factory));
+                trials.push_back(run_trial(
+                    "global", trial, thread_count, operations, global_factory));
+            }
         }
 
-        // Sharded book
-        {
-            g_id.store(1, std::memory_order_relaxed);
-            ShardedOrderBook<MutexPolicy> shard(static_cast<std::size_t>(tc) * OPS_PER_THREAD + 10);
-            std::vector<std::thread>         threads;
-            std::vector<std::vector<double>> lats(tc);
-            auto t0 = std::chrono::high_resolution_clock::now();
-            for (int t = 0; t < tc; ++t)
-                threads.emplace_back(worker_sharded, &shard, OPS_PER_THREAD, t, N_SYMBOLS, std::ref(lats[t]));
-            for (auto& th : threads) th.join();
-            auto t1 = std::chrono::high_resolution_clock::now();
-            double el = std::chrono::duration<double>(t1 - t0).count();
-            auto r = aggregate("sharded", N_SYMBOLS, tc, lats, el);
-            results.push_back(r);
-            std::cout << "  [sharded] tput=" << r.throughput_ops_per_sec
-                      << " ops/s | avg=" << r.avg_ns << " ns | p99=" << r.p99_ns << " ns\n";
-        }
-        std::cout << "\n";
+        const auto global = summarize("global", thread_count, trials);
+        const auto sharded = summarize("sharded", thread_count, trials);
+        summaries.push_back(global);
+        summaries.push_back(sharded);
+
+        std::cout << thread_count << " thread(s): global="
+                  << global.throughput_ops_per_sec << " ops/s, sharded="
+                  << sharded.throughput_ops_per_sec << " ops/s, ratio="
+                  << static_cast<double>(sharded.throughput_ops_per_sec) /
+                         static_cast<double>(global.throughput_ops_per_sec)
+                  << "x\n";
     }
 
-    // ── CSV output ────────────────────────────────────────────────────────────
     std::filesystem::create_directories("results");
-    std::ofstream csv("results/sharding_results.csv");
-    csv << "mode,n_symbols,threads,throughput_ops_per_sec,avg_latency_ns,p99_latency_ns\n";
-    for (const auto& r : results)
-        csv << r.label << "," << r.n_symbols << "," << r.threads << ","
-            << r.throughput_ops_per_sec << "," << r.avg_ns << "," << r.p99_ns << "\n";
-    std::cout << "Results saved -> results/sharding_results.csv\n";
+    std::ofstream trial_csv("results/sharding_trials.csv");
+    trial_csv << "mode,trial,n_symbols,threads,throughput_ops_per_sec,"
+                 "p50_latency_ns,p99_latency_ns\n";
+    for (const auto& result : trials) {
+        trial_csv << result.mode << ',' << result.trial << ',' << result.n_symbols << ','
+                  << result.threads << ',' << result.throughput_ops_per_sec << ','
+                  << result.p50_latency_ns << ',' << result.p99_latency_ns << '\n';
+    }
 
-    return 0;
+    std::ofstream summary_csv("results/sharding_results.csv");
+    summary_csv << "mode,n_trials,n_symbols,threads,throughput_ops_per_sec,"
+                   "p50_latency_ns,p99_latency_ns\n";
+    for (const auto& result : summaries) {
+        summary_csv << result.mode << ',' << N_TRIALS << ',' << result.n_symbols << ','
+                    << result.threads << ',' << result.throughput_ops_per_sec << ','
+                    << result.p50_latency_ns << ',' << result.p99_latency_ns << '\n';
+    }
+
+    std::cout << "Results saved to results/sharding_results.csv and "
+                 "results/sharding_trials.csv\n";
 }

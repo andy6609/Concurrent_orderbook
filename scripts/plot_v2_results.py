@@ -18,26 +18,27 @@ def save(fig, name):
 
 # ── Plot 1: Pool vs Default allocator ─────────────────────────────────────────
 def plot_pool(rows):
-    labels, tput, avg_lat, p99_lat = [], [], [], []
+    labels, tput, p50_lat, p99_lat = [], [], [], []
     for r in rows:
-        short = 'OrderPool' if 'OrderPool' in r['allocator'] else 'Default\nallocator'
+        short = 'OrderPool' if 'OrderPool' in r['allocator'] else 'Heap\nnew/delete'
         labels.append(short)
         tput.append(int(r['throughput_ops_per_sec']) / 1_000)
-        avg_lat.append(int(r['avg_latency_ns']) / 1_000)
-        p99_lat.append(int(r['p99_latency_ns']) / 1_000)
+        p50_lat.append(int(r['p50_latency_ns']))
+        p99_lat.append(int(r['p99_latency_ns']))
 
     colors = ['#e74c3c', '#95a5a6']
     x = range(len(labels))
 
     fig, axes = plt.subplots(1, 3, figsize=(13, 4))
-    fig.suptitle('Memory Allocation: OrderPool vs Default Allocator\n'
-                 '(500k add + cancel, single thread)', fontsize=13, fontweight='bold')
+    fig.suptitle('Controlled Order Storage: OrderPool vs Heap new/delete\n'
+                 '(same containers and O(1) cancel path; median of 7 trials)',
+                 fontsize=13, fontweight='bold')
 
     for ax, vals, ylabel, title in zip(
         axes,
-        [tput, avg_lat, p99_lat],
-        ['Throughput (k ops/s)', 'Avg latency (μs)', 'p99 latency (μs)'],
-        ['Throughput', 'Avg Latency', 'p99 Latency'],
+        [tput, p50_lat, p99_lat],
+        ['Throughput (k ops/s)', 'p50 latency (ns)', 'p99 latency (ns)'],
+        ['Throughput', 'p50 Latency', 'p99 Latency'],
     ):
         bars = ax.bar(x, vals, color=colors, width=0.5, edgecolor='white', linewidth=0.8)
         ax.set_xticks(list(x))
@@ -60,7 +61,7 @@ def plot_sharding(rows):
     for r in rows:
         tc   = int(r['threads'])
         tput = int(r['throughput_ops_per_sec']) / 1_000
-        if r['mode'] == 'single':
+        if r['mode'] == 'global':
             single[tc] = tput
         else:
             sharded[tc] = tput
@@ -70,13 +71,13 @@ def plot_sharding(rows):
     sh_tput  = [sharded[t] for t in threads]
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    fig.suptitle('Sharding: Single Book vs ShardedOrderBook (4 symbols)',
+    fig.suptitle('Sharding: Global Lock vs Per-Symbol Locks (4 books)',
                  fontsize=13, fontweight='bold')
 
     # Left: throughput vs threads
     ax = axes[0]
     ax.plot(threads, s_tput,  marker='s', color='#95a5a6', linewidth=2,
-            markersize=7, label='Single book (1 lock)')
+            markersize=7, label='4 books (1 global lock)')
     ax.plot(threads, sh_tput, marker='o', color='#e74c3c', linewidth=2,
             markersize=7, label='Sharded (4 locks)')
     ax.set_xlabel('Threads')
@@ -96,7 +97,7 @@ def plot_sharding(rows):
     ax2.axhline(1.0, color='#95a5a6', linestyle='--', linewidth=1.2, label='baseline (1×)')
     ax2.set_xlabel('Threads')
     ax2.set_ylabel('Sharding speedup (×)')
-    ax2.set_title('Sharding Gain vs Single Book', fontweight='bold')
+    ax2.set_title('Sharding Gain vs Global Lock', fontweight='bold')
     ax2.set_xticks(threads)
     ax2.legend()
     ax2.grid(axis='y', alpha=0.3)
